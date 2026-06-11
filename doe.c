@@ -3047,12 +3047,13 @@ static void chat(GGUFIndex *ps) {
         n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
 
         int pos = 0;
-        for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
+        for (int i = 0; i < n_input - 1 && pos < max_seq - 1; i++, pos++) {
             doe_forward(ps, &is, input_tokens[i], pos);
             dario_ingest(input_tokens[i]); /* feed user tokens into Dario field */
         }
 
         int prev = input_tokens[n_input - 1];
+        dario_ingest(prev); /* D-H2: last token still feeds the field; forwarded once in generation */
         printf("  ");
         int total_births = 0, total_deaths = 0;
 
@@ -3309,12 +3310,13 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
 
     /* Prefill */
     int pos = 0;
-    for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
+    for (int i = 0; i < n_input - 1 && pos < max_seq - 1; i++, pos++) {
         doe_forward(ps, &is, input_tokens[i], pos);
         dario_ingest(input_tokens[i]); /* feed user tokens into Dario field */
     }
 
     int prev = input_tokens[n_input - 1];
+    dario_ingest(prev); /* D-H2: last token still feeds the field; forwarded once in generation */
 
     /* Generate tokens, stream as SSE */
     for (int i = 0; i < max_tokens && pos < max_seq; i++, pos++) {
