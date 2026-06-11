@@ -1735,7 +1735,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 /* array of strings */
                 int is_vocab = strstr(key, "tokenizer.ggml.tokens") != NULL;
                 int is_merges = strstr(key, "tokenizer.ggml.merges") != NULL;
-                if (is_vocab && alen < 200000) {
+                if (is_vocab && alen < 1000000) {
                     ps->vocab_tokens = calloc(alen, sizeof(char*));
                     ps->vocab_size = (int)alen;
                 }
