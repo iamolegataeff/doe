@@ -2073,6 +2073,11 @@ static int notorch_offset = 0; /* rotating window into LoRA rank */
 static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
                          const float *x, const float *dy, float signal) {
     if (fabsf(signal) < 1e-8f) return;
+    /* D-M2/Mythos: learn_signal (:3084) is asymmetric — punishment scales as -pd
+     * (unbounded), reward is capped at 0.1. Clamp it so one high-debt step can't
+     * overwrite the channel ~10x. Canon parity (am_notorch_step :7270). */
+    if (signal >  2.0f) signal =  2.0f;
+    if (signal < -2.0f) signal = -2.0f;
     float lr = F.notorch_lr * signal;
     /* NOTORCH operates at rank 4 but rotates across all LORA_RANK components.
      * each call updates 4 components starting at notorch_offset.
@@ -2084,26 +2089,25 @@ static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
     for (int j = 0; j < nr; j++) {
         int r = (base + j) % rank;
         float s = 0;
-        for (int i = 0; i < out_dim && i < in_dim; i++) s += B[i * rank + r] * dy[i];
+        for (int i = 0; i < out_dim && i < in_dim; i++) s += B[r * in_dim + i] * dy[i];
         u[j] = s + rand_normal() * 0.01f;
     }
-#ifdef USE_BLAS
+    /* Oja's rule on both A and B: grow toward the co-activation (x, dy) through
+     * the learned channel u, with the self-projection subtracted so each rank row
+     * self-normalizes. The channel neither fades (the old bare *= decay) nor blows
+     * up (canon's bare grow). This is what makes the parliament learn in-session
+     * instead of eroding from init noise. */
     for (int j = 0; j < nr; j++) {
         int r = (base + j) % rank;
-        cblas_saxpy(in_dim, lr * u[j], x, 1, A + r, rank);
-    }
-#else
-    for (int i = 0; i < in_dim; i++)
-        for (int j = 0; j < nr; j++) {
-            int r = (base + j) % rank;
-            A[i * rank + r] += lr * x[i] * u[j];
+        float ur = u[j];
+        for (int i = 0; i < in_dim; i++) {                 /* A = [in_dim, rank] */
+            float *a = &A[i * rank + r];
+            *a += lr * ur * (x[i] - ur * (*a));
         }
-#endif
-    /* decay only the components we touched */
-    float decay = F.notorch_decay;
-    for (int j = 0; j < nr; j++) {
-        int r = (base + j) % rank;
-        for (int i = 0; i < out_dim; i++) B[i * rank + r] *= decay;
+        for (int i = 0; i < out_dim && i < in_dim; i++) {  /* B = [rank, in_dim], apply layout */
+            float *b = &B[r * in_dim + i];
+            *b += lr * ur * (dy[i] - ur * (*b));
+        }
     }
     notorch_offset = (base + nr) % rank;
 }
