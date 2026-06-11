@@ -1778,7 +1778,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
             p += alen * elem_sz;
         } else { p += 4; } /* unknown — guess 4 bytes */
     }
-    if (ps->host_dim == 0 || ps->host_n_layers == 0) goto bail;
+    if (ps->host_dim == 0 || ps->host_dim > 16384 || ps->host_n_layers == 0) goto bail; /* D-L8: bound host_dim — lora_out[D] is a stack VLA */
     if (ps->host_heads == 0) ps->host_heads = ps->host_dim / 64;
     if (ps->host_kv_heads == 0) ps->host_kv_heads = ps->host_heads;
     ps->host_head_dim = ps->host_dim / ps->host_heads;
@@ -2507,7 +2507,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     float sc = 1.0f / sqrtf((float)hd);
 
     /* Embedding */
-    if (token < ps->host_vocab)
+    if (token >= 0 && token < ps->host_vocab)
         memcpy(s->x, ps->host_tok_emb + token * D, D * sizeof(float));
     else
         memset(s->x, 0, D * sizeof(float));
@@ -3402,7 +3402,7 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
     }
 
     /* Send done event */
-    write(fd, "data: {\"done\":true}\n\n", 20);
+    write(fd, "data: {\"done\":true}\n\n", 21); /* D-L2: full 21 bytes incl. both \n */
     free_infer(&is);
 }
 
