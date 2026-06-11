@@ -1239,6 +1239,11 @@ static void doe_mv(float *out, const float *W, int dt, const float *x, int r, in
         if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='1') ? 1 : 0; }
         if (g_doe_int8 && doe_qmatvec_i8(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
         if (doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+        /* D-M6: packed dtype but qmatvec failed — never fall through to matvec(),
+         * which would reinterpret the packed bytes as f32 (the generalized sonar
+         * bug). Loud abort instead of silent garbage / segfault. */
+        fprintf(stderr, "[doe] FATAL: doe_qmatvec failed for packed dtype %d (r=%d c=%d); refusing to read packed bytes as f32\n", dt, r, c);
+        abort();
     }
     matvec(out, W, x, r, c);
 }
