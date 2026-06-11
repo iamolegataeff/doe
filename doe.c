@@ -2423,8 +2423,10 @@ static int mycelium_load(GGUFIndex *ps, uint64_t target_fp) {
                 ex->alive = 1;
                 fread(&ex->vitality, 4, 1, f);
                 fread(&ex->frequency, 4, 1, f);
-                fread(ex->lora_A, sizeof(float), dim * rank, f);
-                fread(ex->lora_B, sizeof(float), rank * dim, f);
+                if (fread(ex->lora_A, sizeof(float), dim * rank, f) != (size_t)(dim * rank) ||
+                    fread(ex->lora_B, sizeof(float), rank * dim, f) != (size_t)(rank * dim)) {
+                    fclose(f); return 0; /* D-L3: truncated spore — bail, don't load garbage experts */
+                }
             } else if (ex->alive) {
                 free_lora_expert(ex);
             }
@@ -3555,7 +3557,6 @@ int main(int argc, char **argv) {
             printf("  --threads N     CPU threads for matvec (default: all cores)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
-            printf("  --lora-rank N   LoRA rank (default: 16)\n");
             printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n\n");
             printf("  BLAS: cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe\n");
             printf("  GPU:  cc doe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o doe\n");
@@ -3564,7 +3565,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── Thread count for matvec ── */
-    g_n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (g_n_threads == 0) g_n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN); /* D-L1: respect --threads if the user set it */
     if (g_n_threads < 1) g_n_threads = 1;
     if (g_n_threads > 32) g_n_threads = 32;
 
@@ -3575,7 +3576,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) F.prophecy = atoi(argv[++i]);
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) F.destiny = atof(argv[++i]);
-        else if (strcmp(argv[i], "--lora-rank") == 0 && i+1 < argc) { /* handled in index_load */ }
+        else if (strcmp(argv[i], "--lora-rank") == 0 && i+1 < argc) { i++; /* D-L1: accepted for compat; rank comes from the GGUF, not a flag */ }
         else if (strcmp(argv[i], "--lora-alpha") == 0 && i+1 < argc) F.lora_alpha = atof(argv[++i]);
     }
 
