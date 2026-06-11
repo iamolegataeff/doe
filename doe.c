@@ -1893,6 +1893,22 @@ static int index_load(GGUFIndex *ps, const char *path) {
         goto bail;
     }
 
+    /* D-M5: the forward guards only wq; a layer with wq wired but any attention
+     * matvec weight (wk/wv/wo) NULL — skipped because it was in an unsupported
+     * quant — would reach doe_mv with a NULL pointer and segfault. DoE scans
+     * directories for foreign GGUFs, so mixed-quant bodies are realistic. Drop
+     * incomplete layers loudly so the forward's `if (!wq) continue` skips them. */
+    for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+        if (!ps->host_layers[l].wq) continue;
+        int ffn_ok = (ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down) ||
+                     (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down);
+        if (!ps->host_layers[l].wk || !ps->host_layers[l].wv ||
+            !ps->host_layers[l].wo || !ffn_ok) {
+            printf("[doe] WARNING: host layer %d incomplete (a weight is in an unsupported quant); dropping the layer\n", l);
+            ps->host_layers[l].wq = NULL;
+        }
+    }
+
     /* ── Weight profiling — the sonar ── */
     printf("[sonar] profiling host weights...\n");
     ps->profile.n_layers = ps->host_n_layers;
