@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra
 LDFLAGS  = -lm -lpthread
 
-.PHONY: all test clean run run-int8 run-smollm360 run-f16 quantize-q4
+.PHONY: all metal test clean run run-int8 run-smollm360 run-f16 quantize-q4
 
 all: doe_field
 
@@ -12,6 +12,14 @@ doe_field: doe.c
 # macOS Accelerate
 blas: doe.c
 	$(CC) $(CFLAGS) -DUSE_BLAS -DACCELERATE $< $(LDFLAGS) -framework Accelerate -o doe_field
+
+# Apple Metal — Q4_K matvec on GPU via notorch_metal (resident weights, zero-copy);
+# Q6_K/F32/F16 stay on CPU. Runs 24B-class Q4_K on a 24GB Mac. Obj-C++ needs -std=c++17.
+MM_FLAGS = -O2 -Wall -Wextra -std=c++17 -I.
+notorch_metal.o: notorch_metal.mm notorch_metal.h
+	clang++ $(MM_FLAGS) -DUSE_METAL -fobjc-arc -c notorch_metal.mm -o notorch_metal.o
+metal: doe.c notorch_metal.o notorch_metal.h
+	$(CC) $(CFLAGS) -DUSE_BLAS -DACCELERATE -DUSE_METAL doe.c notorch_metal.o $(LDFLAGS) -framework Accelerate -framework Metal -framework Foundation -lc++ -o doe_field
 
 # OpenBLAS (Linux)
 openblas: doe.c

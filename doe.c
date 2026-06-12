@@ -42,6 +42,9 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <dirent.h>
+#ifdef USE_METAL
+#include "notorch_metal.h"
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1244,6 +1247,10 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
 static int g_doe_int8 = -1;
 static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
     if (dt) {
+#ifdef USE_METAL
+        /* Metal: Q4_K (dt=12) through nt_metal_q4k_matvec (resident weights); fallback to CPU on rc!=0 */
+        if (dt == 12 && nt_metal_available() && nt_metal_q4k_matvec(out, (const uint8_t*)W, x, r, c) == 0) return;
+#endif
         if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='1') ? 1 : 0; }
         if (g_doe_int8 && doe_qmatvec_i8(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
         if (doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
@@ -1666,6 +1673,11 @@ static int index_load(GGUFIndex *ps, const char *path) {
     ps->mmap_base = mmap(NULL, ps->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (ps->mmap_base == MAP_FAILED) { ps->mmap_base = NULL; return 0; }
+#ifdef USE_METAL
+    /* Metal: register the whole packed GGUF block as a resident zero-copy GPU buffer (Phase 2 —
+     * weights bind by offset, no per-token upload). mmap base is page-aligned. */
+    if (nt_metal_available()) nt_metal_register_base(ps->mmap_base, ps->mmap_size);
+#endif
 
     /* Parse GGUF header */
     uint8_t *p = ps->mmap_base, *pend = ps->mmap_base + ps->mmap_size;
@@ -3120,7 +3132,9 @@ static void chat(GGUFIndex *ps) {
         printf("  ");
         int total_births = 0, total_deaths = 0;
 
+        struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
+            _gi = i + 1;
             float *lg = doe_forward(ps, &is, prev, pos);
 
             /* A12b: raw host-forward token-1 NaN/Inf count + finite top-5 (before field/sample) */
@@ -3216,6 +3230,11 @@ static void chat(GGUFIndex *ps) {
             token_decode_print(ps, next);
             fflush(stdout);
             prev = next;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &_gt1);
+        if (getenv("DOE_DEBUG_TIMING")) {
+            double _el = (_gt1.tv_sec - _gt0.tv_sec) + (_gt1.tv_nsec - _gt0.tv_nsec) / 1e9;
+            fprintf(stderr, "[timing] decode %d tokens in %.2fs = %.2f t/s\n", _gi, _el, _el > 0 ? _gi / _el : 0.0);
         }
         printf("\n");
 
