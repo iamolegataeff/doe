@@ -124,6 +124,13 @@ static uint64_t rng_next(void) { rng_state ^= rng_state<<13; rng_state ^= rng_st
 static float rand_uniform(void) { return (float)(rng_next()&0x7FFFFFFF)/(float)0x7FFFFFFF; }
 static float rand_normal(void) { float u1=rand_uniform(),u2=rand_uniform(); if(u1<1e-10f)u1=1e-10f; return sqrtf(-2.0f*logf(u1))*cosf(6.2831853f*u2); }
 static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+static float g_field_gain = 1.0f; /* A11a: scale Dario field overlay on logits; 1.0 = full, 0 = bare host */
+static int g_train = 0; /* A13b/A14: notorch online-learning during inference; DEFAULT 0=off (Oleg+Mythos 2026-06-12: organism must not re-sew its own weights mid-sentence; online learning returns later as async between turns, ogemma vision); 1=on */
+/* A14: expert poison check — catches BOTH faces of notorch drift: NaN/Inf and finite |value|-explosion
+ * (the latter passes isfinite but still poisons the forward when injected at alpha>0). */
+static int lora_poisoned(const float *A, const float *B) {
+    return !isfinite(A[0]) || !isfinite(B[0]) || fabsf(A[0]) > 1e4f || fabsf(B[0]) > 1e4f;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * AML FIELD STATE — the soul. from ariannamethod.c, distilled.
@@ -885,7 +892,7 @@ static void apply_field_to_logits(float *logits, int n) {
         float a_term = eff_gamma * A_sig[i];
         float t_term = (i < 50) ? t_boost * (1.0f - (float)i / 50.0f) : 0;
 
-        logits[i] += h_term + f_term + a_term + t_term;
+        logits[i] += g_field_gain * (h_term + f_term + a_term + t_term);
     }
 
     /* tau_mod feeds into effective temperature (applied in field_step) */
@@ -1054,6 +1061,7 @@ static void *matvec_worker(void *arg) {
 }
 
 static int g_n_threads = 0;
+static float g_rep_penalty = 1.0f; /* A10a: repetition penalty over generated history; 1.0 = off */
 
 static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #ifdef USE_CUBLAS
@@ -1718,6 +1726,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
             else if (strstr(key, "bos_token_id")) ps->bos_id = (int)val;
             else if (strstr(key, "eos_token_id")) ps->eos_id = (int)val;
             else if (strstr(key, "add_space_prefix")) ps->add_space_prefix = (int)val;
+            else if (strstr(key, "attention.key_length")) ps->host_head_dim = (int)val;
         } else if (vtype == 6) { /* float32 */
             PC(4); float fval; memcpy(&fval, p, 4); p += 4;
             if (strstr(key, "rope.freq_base")) ps->rope_theta = fval;
@@ -1781,7 +1790,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
     if (ps->host_dim == 0 || ps->host_dim > 16384 || ps->host_n_layers == 0) goto bail; /* D-L8: bound host_dim — lora_out[D] is a stack VLA */
     if (ps->host_heads == 0) ps->host_heads = ps->host_dim / 64;
     if (ps->host_kv_heads == 0) ps->host_kv_heads = ps->host_heads;
-    ps->host_head_dim = ps->host_dim / ps->host_heads;
+    if (ps->host_head_dim == 0) ps->host_head_dim = ps->host_dim / ps->host_heads; /* Y-1b: prefer attention.key_length (Mistral hd=128 ≠ 5120/32=160) */
     if (ps->host_hidden == 0) ps->host_hidden = ps->host_dim * 4;
 
     /* Parse tensor info */
@@ -1999,9 +2008,9 @@ static int index_load(GGUFIndex *ps, const char *path) {
     /* Build token hash table for O(1) lookup, then GPT-2 BPE scores */
     tok_ht_build(ps);
     build_gpt2_scores(ps);
-    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d kv=%d vocab=%d %.1fMB)\n",
+    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d kv=%d hd=%d vocab=%d %.1fMB)\n",
            path, ps->host_arch, ps->host_dim, ps->host_n_layers, ps->host_heads,
-           ps->host_kv_heads, ps->host_vocab, (float)ps->mmap_size/(1024*1024));
+           ps->host_kv_heads, ps->host_head_dim, ps->host_vocab, (float)ps->mmap_size/(1024*1024));
     printf("[doe] rope_theta=%.0f rms_eps=%.1e bias=%s\n",
            ps->rope_theta, ps->rms_norm_eps,
            ps->host_layers[0].bq ? "yes" : "no");
@@ -2332,6 +2341,14 @@ static void mycelium_init(MyceliumState *ms) {
 }
 
 static void mycelium_save(GGUFIndex *ps, int step, float fitness) {
+    /* A13: NaN-quarantine gate — never persist a poisoned spore (else NaN experts survive restart) */
+    for (int l = 0; l < ps->n_field_layers; l++)
+        for (int e = 0; e < MAX_EXPERTS; e++)
+            if (ps->field_layers[l].experts[e].alive &&
+                lora_poisoned(ps->field_layers[l].experts[e].lora_A, ps->field_layers[l].experts[e].lora_B)) {
+                printf("[mycelium] poisoned expert L%d e%d (NaN/Inf/|w|>1e4) — spore NOT saved (quarantine)\n", l, e);
+                return;
+            }
     char path[256];
     snprintf(path, 256, "%s/spore_%016llx_s%d.bin", MYCELIUM_DIR,
              (unsigned long long)ps->profile.fingerprint, step);
@@ -2555,11 +2572,12 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 for (int d = 0; d < hd; d++) oh[d] += a * s->value_cache[vo+d];
             }
         }
-        doe_mv(s->xb, ps->host_layers[l].wo, ps->host_layers[l].wo_dt, ao, D, D);
+        doe_mv(s->xb, ps->host_layers[l].wo, ps->host_layers[l].wo_dt, ao, D, ps->host_heads*hd); /* Y-1b: WO cols = heads*head_dim (4096), not dim (5120) */
         for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
 
         /* ── Parliament election + LoRA injection (after attention, before FFN) ── */
-        if (l < ps->n_field_layers) {
+        /* A13: skip injection entirely when alpha=0 — avoids 0*NaN poisoning from drifted experts */
+        if (l < ps->n_field_layers && ps->lora_alpha != 0.0f) {
             FieldLayer *fl = &ps->field_layers[l];
             int selected[MAX_EXPERTS]; float weights[MAX_EXPERTS];
             int k = parliament_elect(&fl->parliament, fl->experts, s->x, D, &s->hs, selected, weights);
@@ -3079,6 +3097,17 @@ static void chat(GGUFIndex *ps) {
         if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
         n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
 
+        /* A12a: input-id dump WITH bos for parity vs llama (env-guarded, diagnostic only) */
+        if (getenv("DOE_DEBUG_INPUT")) {
+            fprintf(stderr, "[inputdump] n=%d ids:", n_input);
+            for (int di = 0; di < n_input; di++) fprintf(stderr, " %d", input_tokens[di]);
+            fprintf(stderr, "\n");
+        }
+
+        /* A10a: repetition-penalty history (prompt + generated tokens) */
+        int rep_hist[768]; int n_rep = 0;
+        for (int ri = 0; ri < n_input && n_rep < 768; ri++) rep_hist[n_rep++] = input_tokens[ri];
+
         int pos = 0;
         for (int i = 0; i < n_input - 1 && pos < max_seq - 1; i++, pos++) {
             doe_forward(ps, &is, input_tokens[i], pos);
@@ -3093,11 +3122,42 @@ static void chat(GGUFIndex *ps) {
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
             float *lg = doe_forward(ps, &is, prev, pos);
 
+            /* A12b: raw host-forward token-1 NaN/Inf count + finite top-5 (before field/sample) */
+            if (i == 0 && getenv("DOE_DEBUG_LOGITS")) {
+                int V = ps->host_vocab, nnan = 0, ninf = 0;
+                float *tmp = malloc(V * sizeof(float));
+                for (int v = 0; v < V; v++) {
+                    if (isnan(lg[v])) { nnan++; tmp[v] = -1e30f; }
+                    else if (isinf(lg[v])) { ninf++; tmp[v] = -1e30f; }
+                    else tmp[v] = lg[v];
+                }
+                fprintf(stderr, "[logitdump] tok1 nan=%d inf=%d /%d, finite top5:", nnan, ninf, V);
+                for (int top = 0; top < 5; top++) {
+                    int bi = 0; for (int v = 1; v < V; v++) if (tmp[v] > tmp[bi]) bi = v;
+                    const char *ts = (ps->vocab_tokens && ps->vocab_tokens[bi]) ? ps->vocab_tokens[bi] : "?";
+                    fprintf(stderr, " (%d '%s'=%.3f)", bi, ts, tmp[bi]);
+                    tmp[bi] = -1e30f;
+                }
+                fprintf(stderr, "\n");
+                free(tmp);
+            }
+
             /* Field modulation on logits — Dario Equation */
             field_step(1.0f);
             apply_field_to_logits(lg, ps->host_vocab);
 
+            /* A10a: repetition penalty over recent history (llama-style), last 64 tokens */
+            if (g_rep_penalty > 1.0f) {
+                int rstart = n_rep > 64 ? n_rep - 64 : 0;
+                for (int r = rstart; r < n_rep; r++) {
+                    int t = rep_hist[r];
+                    if (t >= 0 && t < ps->host_vocab)
+                        lg[t] = lg[t] > 0 ? lg[t] / g_rep_penalty : lg[t] * g_rep_penalty;
+                }
+            }
+
             int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
+            if (n_rep < 768) rep_hist[n_rep++] = next;
 
             /* Stop on EOS or chat-template end tokens */
             if (next == ps->eos_id) break;
@@ -3118,15 +3178,19 @@ static void chat(GGUFIndex *ps) {
             /* Dario field: ingest generated token (co-occurrence + prophecy + destiny) */
             dario_ingest(next);
 
-            /* NOTORCH Hebbian update — debt drives learning */
+            /* NOTORCH Hebbian update — debt drives learning (A13b: gated by --train) */
             float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
-            for (int l = 0; l < ps->n_field_layers; l++) {
+            if (g_train) for (int l = 0; l < ps->n_field_layers; l++) {
                 FieldLayer *fl = &ps->field_layers[l];
                 for (int e = 0; e < MAX_EXPERTS; e++) {
                     if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
                     notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
                                 ps->host_dim, ps->host_dim, ps->lora_rank,
                                 is.x, is.xb, learn_signal);
+                    /* A14: poison-quarantine (NaN/Inf + finite |value|-explosion) — freeze + death */
+                    if (lora_poisoned(fl->experts[e].lora_A, fl->experts[e].lora_B)) {
+                        fl->experts[e].alive = 0; total_deaths++;
+                    }
                 }
             }
 
@@ -3379,13 +3443,16 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
         dario_ingest(next);
 
         float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
-        for (int l = 0; l < ps->n_field_layers; l++) {
+        if (g_train) for (int l = 0; l < ps->n_field_layers; l++) {
             FieldLayer *fl = &ps->field_layers[l];
             for (int e = 0; e < MAX_EXPERTS; e++) {
                 if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
                 notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
                             ps->host_dim, ps->host_dim, ps->lora_rank,
                             is.x, is.xb, learn_signal);
+                /* A14: poison-quarantine (NaN/Inf + finite |value|-explosion) — freeze */
+                if (lora_poisoned(fl->experts[e].lora_A, fl->experts[e].lora_B))
+                    fl->experts[e].alive = 0;
             }
         }
 
@@ -3546,6 +3613,9 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i+1 < argc) snprintf(gguf_path, 256, "%s", argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) { g_n_threads = atoi(argv[++i]); if (g_n_threads < 1) g_n_threads = 1; }
+        else if (strcmp(argv[i], "--rep-penalty") == 0 && i+1 < argc) { g_rep_penalty = atof(argv[++i]); if (g_rep_penalty <= 0.0f) g_rep_penalty = 1.0f; }
+        else if (strcmp(argv[i], "--field-gain") == 0 && i+1 < argc) { g_field_gain = atof(argv[++i]); if (g_field_gain < 0.0f) g_field_gain = 0.0f; }
+        else if (strcmp(argv[i], "--train") == 0 && i+1 < argc) { g_train = atoi(argv[++i]) ? 1 : 0; }
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--serve") == 0 && i+1 < argc) { g_serve_port = atoi(argv[++i]); }
@@ -3557,7 +3627,10 @@ int main(int argc, char **argv) {
             printf("  --threads N     CPU threads for matvec (default: all cores)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
-            printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n\n");
+            printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n");
+            printf("  --rep-penalty F repetition penalty over history (default: 1.0 = off)\n");
+            printf("  --field-gain F  scale Dario field overlay on logits (default: 1.0; 0 = bare host)\n");
+            printf("  --train N       notorch online-learning during inference (default: 0 = off; 1 = on)\n\n");
             printf("  BLAS: cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe\n");
             printf("  GPU:  cc doe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o doe\n");
             return 0;
