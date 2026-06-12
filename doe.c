@@ -2576,9 +2576,18 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         if (ps->host_layers[l].attn_norm) rmsnorm(xn, s->x, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
         else memcpy(xn, s->x, D*4);
 
+        /* {q,k,v} share xn — batch into one command buffer, one GPU sync (Metal).
+         * out (s->q/k/v) is written only at commit, so commit must precede the
+         * bias adds below that read them. Bit-identical to the solo path. */
+#ifdef USE_METAL
+        int qkv_batch = !getenv("DOE_NO_BATCH") && nt_metal_available() && nt_metal_batch_begin() == 0;
+#endif
         doe_mv(s->q, ps->host_layers[l].wq, ps->host_layers[l].wq_dt, xn, ps->host_heads*hd, D);
         doe_mv(s->k, ps->host_layers[l].wk, ps->host_layers[l].wk_dt, xn, kd, D);
         doe_mv(s->v, ps->host_layers[l].wv, ps->host_layers[l].wv_dt, xn, kd, D);
+#ifdef USE_METAL
+        if (qkv_batch) nt_metal_batch_commit();
+#endif
 
         /* Add attention biases (Qwen2, optional) */
         if (ps->host_layers[l].bq) for (int i = 0; i < ps->host_heads*hd; i++) s->q[i] += ps->host_layers[l].bq[i];
@@ -2650,9 +2659,15 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
             } else if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) {
-                /* Standard separate gate + up */
+                /* Standard separate gate + up — share fn, batch into one sync. */
+#ifdef USE_METAL
+                int gu_batch = !getenv("DOE_NO_BATCH") && nt_metal_available() && nt_metal_batch_begin() == 0;
+#endif
                 doe_mv(s->hb, ps->host_layers[l].ffn_gate, ps->host_layers[l].ffn_gate_dt, fn, H, D);
                 doe_mv(s->hb2, ps->host_layers[l].ffn_up, ps->host_layers[l].ffn_up_dt, fn, H, D);
+#ifdef USE_METAL
+                if (gu_batch) nt_metal_batch_commit();
+#endif
                 for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb[i]) * s->hb2[i];
                 doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
