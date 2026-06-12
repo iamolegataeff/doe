@@ -1245,11 +1245,27 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
  * DOE_INT8=1 opts the Q4_0 weights into the int8 dynamic-activation-quant fast path
  * (doe_qmatvec_i8, NEON SDOT) — APPROXIMATE; default is the exact dequant-inline path. */
 static int g_doe_int8 = -1;
-static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
+static double g_prof_mv_ns = 0; static int g_prof_on = -1; /* DOE_PROFILE: matvec share of decode */
+static void doe_mv_impl(float *out, const float *W, int dt, const float *x, int r, int c) {
     if (dt) {
 #ifdef USE_METAL
-        /* Metal: Q4_K (dt=12) through nt_metal_q4k_matvec (resident weights); fallback to CPU on rc!=0 */
+        /* Metal: Q4_K (dt=12) + Q6_K (dt=14, lm_head) through GPU kernels (resident weights); CPU fallback on rc!=0 */
         if (dt == 12 && nt_metal_available() && nt_metal_q4k_matvec(out, (const uint8_t*)W, x, r, c) == 0) return;
+        if (dt == 14 && nt_metal_available() && nt_metal_q6k_matvec(out, (const uint8_t*)W, x, r, c) == 0) {
+            if (getenv("DOE_VERIFY_Q6K")) {  /* real-path bit-identical check vs CPU dequant on live weights */
+                float *vt = (float*)malloc((size_t)r * 4);
+                if (vt) {
+                    pq_q6_k_rows(vt, (const uint8_t*)W, x, 0, r, c);
+                    float mx = 0; int bad = 0;
+                    for (int z = 0; z < r; z++) { float dn = fabsf(vt[z]) > 1.0f ? fabsf(vt[z]) : 1.0f;
+                        float rl = fabsf(out[z] - vt[z]) / dn; if (rl > mx) { mx = rl; bad = z; } }
+                    fprintf(stderr, "[verify-q6k] m=%d k=%d max_rel=%.2e row %d: cpu=%.4f metal=%.4f\n",
+                            r, c, mx, bad, vt[bad], out[bad]);
+                    free(vt);
+                }
+            }
+            return;
+        }
 #endif
         if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='1') ? 1 : 0; }
         if (g_doe_int8 && doe_qmatvec_i8(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
@@ -1261,6 +1277,15 @@ static void doe_mv(float *out, const float *W, int dt, const float *x, int r, in
         abort();
     }
     matvec(out, W, x, r, c);
+}
+/* DOE_PROFILE wrapper: time the matvec share of decode (Metal Q4_K + CPU rest). Off = zero overhead. */
+static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
+    if (g_prof_on < 0) { const char *e = getenv("DOE_PROFILE"); g_prof_on = (e && e[0]) ? 1 : 0; }
+    if (!g_prof_on) { doe_mv_impl(out, W, dt, x, r, c); return; }
+    struct timespec _p0, _p1; clock_gettime(CLOCK_MONOTONIC, &_p0);
+    doe_mv_impl(out, W, dt, x, r, c);
+    clock_gettime(CLOCK_MONOTONIC, &_p1);
+    g_prof_mv_ns += (_p1.tv_sec - _p0.tv_sec) * 1e9 + (_p1.tv_nsec - _p0.tv_nsec);
 }
 
 static void softmax_n(float *x, int n) {
@@ -3133,6 +3158,7 @@ static void chat(GGUFIndex *ps) {
         int total_births = 0, total_deaths = 0;
 
         struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
+        g_prof_mv_ns = 0; /* reset: matvec profile over decode loop only (exclude prefill) */
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
             _gi = i + 1;
             float *lg = doe_forward(ps, &is, prev, pos);
@@ -3232,9 +3258,14 @@ static void chat(GGUFIndex *ps) {
             prev = next;
         }
         clock_gettime(CLOCK_MONOTONIC, &_gt1);
-        if (getenv("DOE_DEBUG_TIMING")) {
+        if (getenv("DOE_DEBUG_TIMING") || g_prof_on > 0) {
             double _el = (_gt1.tv_sec - _gt0.tv_sec) + (_gt1.tv_nsec - _gt0.tv_nsec) / 1e9;
             fprintf(stderr, "[timing] decode %d tokens in %.2fs = %.2f t/s\n", _gi, _el, _el > 0 ? _gi / _el : 0.0);
+            if (g_prof_on > 0) {
+                double _mv = g_prof_mv_ns / 1e9;
+                fprintf(stderr, "[profile] matvec %.2fs (%.0f%% of decode) | rest %.2fs (attention/rmsnorm/FFN/sample)\n",
+                        _mv, _el > 0 ? 100 * _mv / _el : 0.0, _el - _mv);
+            }
         }
         printf("\n");
 
