@@ -3104,9 +3104,10 @@ static void chat(GGUFIndex *ps) {
             fprintf(stderr, "\n");
         }
 
-        /* A10a: repetition-penalty history (prompt + generated tokens) */
-        int rep_hist[768]; int n_rep = 0;
-        for (int ri = 0; ri < n_input && n_rep < 768; ri++) rep_hist[n_rep++] = input_tokens[ri];
+        /* A14 (Mythos gen-only): repetition history = GENERATED tokens ONLY — prompt untouched.
+         * A10a poisoned the start by penalizing prompt identity-tokens; here rep_hist stays empty
+         * until generation begins. Window = last ~64 generated (applied below). */
+        int rep_hist[256]; int n_rep = 0;
 
         int pos = 0;
         for (int i = 0; i < n_input - 1 && pos < max_seq - 1; i++, pos++) {
@@ -3157,7 +3158,7 @@ static void chat(GGUFIndex *ps) {
             }
 
             int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
-            if (n_rep < 768) rep_hist[n_rep++] = next;
+            if (n_rep < 256) rep_hist[n_rep++] = next;
 
             /* Stop on EOS or chat-template end tokens */
             if (next == ps->eos_id) break;
@@ -3628,7 +3629,7 @@ int main(int argc, char **argv) {
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
             printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n");
-            printf("  --rep-penalty F repetition penalty over history (default: 1.0 = off)\n");
+            printf("  --rep-penalty F repetition penalty over GENERATED tokens (default: 1.0 = off; 1.05 polishes demo tail)\n");
             printf("  --field-gain F  scale Dario field overlay on logits (default: 1.0; 0 = bare host)\n");
             printf("  --train N       notorch online-learning during inference (default: 0 = off; 1 = on)\n\n");
             printf("  BLAS: cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe\n");
