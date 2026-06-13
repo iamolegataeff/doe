@@ -1248,6 +1248,25 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
  * (doe_qmatvec_i8, NEON SDOT) — APPROXIMATE; default is the exact dequant-inline path. */
 static int g_doe_int8 = -1;
 static double g_prof_mv_ns = 0; static int g_prof_on = -1; /* DOE_PROFILE: matvec share of decode */
+/* DOE_PERSHAPE: per-group matvec timing (Mythos M3 geometry input). Groups keyed
+ * by (m,k) against model dims set at forward start. Sync path only (DOE_NO_SLOTS+
+ * DOE_NO_BATCH) so each matvec is timed individually. */
+enum { MVG_QKV = 0, MVG_O, MVG_FFNGU, MVG_FFNDN, MVG_LMHEAD, MVG_N, MVG_OTHER = -1 };
+static int g_ps_on = -1;
+static double g_ps_ns[MVG_N];
+static long   g_ps_cnt[MVG_N];
+static int    g_ps_m[MVG_N], g_ps_k[MVG_N], g_ps_dt[MVG_N];
+static int    g_ps_D, g_ps_qn, g_ps_kd, g_ps_H, g_ps_H2, g_ps_vocab; /* dims for keying */
+static int pershape_group(int m, int k) {
+    if (k == g_ps_D) {
+        if (m == g_ps_qn || m == g_ps_kd) return MVG_QKV;
+        if (m == g_ps_H2 || m == g_ps_H)  return MVG_FFNGU;
+        if (m == g_ps_vocab)              return MVG_LMHEAD;
+    }
+    if (k == g_ps_qn && m == g_ps_D) return MVG_O;
+    if (k == g_ps_H  && m == g_ps_D) return MVG_FFNDN;
+    return MVG_OTHER;
+}
 static void doe_mv_impl(float *out, const float *W, int dt, const float *x, int r, int c) {
     if (dt) {
 #ifdef USE_METAL
@@ -1282,12 +1301,18 @@ static void doe_mv_impl(float *out, const float *W, int dt, const float *x, int 
 }
 /* DOE_PROFILE wrapper: time the matvec share of decode (Metal Q4_K + CPU rest). Off = zero overhead. */
 static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
-    if (g_prof_on < 0) { const char *e = getenv("DOE_PROFILE"); g_prof_on = (e && e[0]) ? 1 : 0; }
-    if (!g_prof_on) { doe_mv_impl(out, W, dt, x, r, c); return; }
+    if (g_prof_on < 0) { const char *e = getenv("DOE_PROFILE");  g_prof_on = (e && e[0]) ? 1 : 0; }
+    if (g_ps_on   < 0) { const char *e = getenv("DOE_PERSHAPE"); g_ps_on   = (e && e[0]) ? 1 : 0; }
+    if (!g_prof_on && !g_ps_on) { doe_mv_impl(out, W, dt, x, r, c); return; }
     struct timespec _p0, _p1; clock_gettime(CLOCK_MONOTONIC, &_p0);
     doe_mv_impl(out, W, dt, x, r, c);
     clock_gettime(CLOCK_MONOTONIC, &_p1);
-    g_prof_mv_ns += (_p1.tv_sec - _p0.tv_sec) * 1e9 + (_p1.tv_nsec - _p0.tv_nsec);
+    double _ns = (_p1.tv_sec - _p0.tv_sec) * 1e9 + (_p1.tv_nsec - _p0.tv_nsec);
+    if (g_prof_on) g_prof_mv_ns += _ns;
+    if (g_ps_on) {
+        int g = pershape_group(r, c);
+        if (g >= 0) { g_ps_ns[g] += _ns; g_ps_cnt[g]++; g_ps_m[g] = r; g_ps_k[g] = c; g_ps_dt[g] = dt; }
+    }
 }
 
 static void softmax_n(float *x, int n) {
@@ -2581,6 +2606,8 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     int H = ps->host_hidden;
     int hg = ps->host_heads / ps->host_kv_heads;
     float sc = 1.0f / sqrtf((float)hd);
+    /* per-shape dims for DOE_PERSHAPE matvec grouping (keys pershape_group). */
+    g_ps_D = D; g_ps_qn = ps->host_heads*hd; g_ps_kd = kd; g_ps_H = H; g_ps_H2 = H*2; g_ps_vocab = ps->host_vocab;
 
     /* Embedding */
     if (token >= 0 && token < ps->host_vocab)
@@ -2588,7 +2615,105 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     else
         memset(s->x, 0, D * sizeof(float));
 
-    for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+    /* ── M4 stage (г): resident decode — the whole token in ONE command buffer.
+     * X lives in SLOT_X on the GPU across all layers; 1 upload + 1 commit + 1
+     * download per token instead of 2 commits + 2 CPU round-trips per layer
+     * (~80 -> ~1 GPU syncs). Requires lora_alpha==0 (no CPU parliament step
+     * between attn and ffn) and every layer slot-eligible. The serial-dispatch
+     * encoder serialises the reused slots, so it is bit-identical to the
+     * per-layer slot path. DOE_NO_RESIDENT falls back. */
+    int resident_done = 0;
+#ifdef USE_METAL
+    if (!getenv("DOE_NO_SLOTS") && !getenv("DOE_NO_RESIDENT") && nt_metal_available() &&
+        ps->lora_alpha == 0.0f) {
+        int eligible = 1;
+        for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+            if (!ps->host_layers[l].wq) continue;
+            int qd=ps->host_layers[l].wq_dt, kdt=ps->host_layers[l].wk_dt,
+                vd=ps->host_layers[l].wv_dt, od=ps->host_layers[l].wo_dt,
+                ddt=ps->host_layers[l].ffn_down_dt;
+            int fused = ps->host_layers[l].ffn_gate_up != NULL;
+            int gdt = fused ? ps->host_layers[l].ffn_gate_up_dt : ps->host_layers[l].ffn_gate_dt;
+            int udt = fused ? gdt : ps->host_layers[l].ffn_up_dt;
+            int has_ffn = ps->host_layers[l].ffn_down &&
+                          (fused || (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up));
+            if (!ps->host_layers[l].attn_norm || !ps->host_layers[l].ffn_norm || !has_ffn ||
+                ps->host_layers[l].bq || ps->host_layers[l].bk || ps->host_layers[l].bv ||
+                !((qd==12||qd==14)&&(kdt==12||kdt==14)&&(vd==12||vd==14)&&(od==12||od==14)&&
+                  (gdt==12||gdt==14)&&(udt==12||udt==14)&&(ddt==12||ddt==14))) { eligible = 0; break; }
+        }
+        if (eligible) {
+            int qn = ps->host_heads * hd;
+            nt_metal_slot_alloc(SLOT_X, D*4);  nt_metal_slot_alloc(SLOT_FN, D*4);
+            nt_metal_slot_alloc(SLOT_Q, qn*4); nt_metal_slot_alloc(SLOT_K, kd*4);
+            nt_metal_slot_alloc(SLOT_V, kd*4); nt_metal_slot_alloc(SLOT_O, qn*4);
+            nt_metal_slot_alloc(SLOT_XB, D*4); nt_metal_slot_alloc(SLOT_G, H*4);
+            nt_metal_slot_alloc(SLOT_U, H*4);  nt_metal_slot_alloc(SLOT_HB, H*4);
+            nt_metal_slot_alloc(SLOT_DN, D*4);
+            nt_metal_slot_upload(SLOT_X, s->x, D*4);
+            nt_metal_batch_begin();
+            for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+                if (!ps->host_layers[l].wq) continue;
+                int qd=ps->host_layers[l].wq_dt, kdt=ps->host_layers[l].wk_dt,
+                    vd=ps->host_layers[l].wv_dt, od=ps->host_layers[l].wo_dt,
+                    ddt=ps->host_layers[l].ffn_down_dt;
+                int co2 = l * s->max_seq * kd + pos * kd;
+                float *Kbase = s->key_cache   + (size_t)l * s->max_seq * kd;
+                float *Vbase = s->value_cache + (size_t)l * s->max_seq * kd;
+                const uint8_t *Wdn = (const uint8_t*)ps->host_layers[l].ffn_down;
+                /* attention half-layer */
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
+                if (qd==14)  nt_metal_q6k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                if (kdt==14) nt_metal_q6k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta);
+                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta);
+                nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
+                nt_metal_copy_to_region(s->value_cache + co2, SLOT_V, kd*4);
+                nt_metal_attn_decode(SLOT_O, SLOT_Q, Kbase, Vbase, pos+1,
+                                     ps->host_heads, ps->host_kv_heads, hd,
+                                     (uint32_t)kd, (uint32_t)hd, (uint32_t)kd, (uint32_t)hd, sc);
+                if (od==14)  nt_metal_q6k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                else         nt_metal_q4k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                nt_metal_add(SLOT_X, SLOT_X, SLOT_XB, D);
+                /* ffn half-layer (fused gate_up or separate gate + up) */
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
+                if (ps->host_layers[l].ffn_gate_up) {
+                    int gdt = ps->host_layers[l].ffn_gate_up_dt;
+                    size_t gu_row = quant_raw_bytes(gdt, D);
+                    const uint8_t *Wgu = (const uint8_t*)ps->host_layers[l].ffn_gate_up;
+                    if (gdt==14) { nt_metal_q6k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q6k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                    else         { nt_metal_q4k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q4k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                } else {
+                    const uint8_t *Wg = (const uint8_t*)ps->host_layers[l].ffn_gate;
+                    const uint8_t *Wu = (const uint8_t*)ps->host_layers[l].ffn_up;
+                    int g2 = ps->host_layers[l].ffn_gate_dt, u2 = ps->host_layers[l].ffn_up_dt;
+                    if (g2==14) nt_metal_q6k_matvec_slot(SLOT_G, Wg, SLOT_FN, H, D);
+                    else        nt_metal_q4k_matvec_slot(SLOT_G, Wg, SLOT_FN, H, D);
+                    if (u2==14) nt_metal_q6k_matvec_slot(SLOT_U, Wu, SLOT_FN, H, D);
+                    else        nt_metal_q4k_matvec_slot(SLOT_U, Wu, SLOT_FN, H, D);
+                }
+                nt_metal_silu_mul(SLOT_HB, SLOT_G, SLOT_U, H);
+                if (ddt==14) nt_metal_q6k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                else         nt_metal_q4k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                nt_metal_add(SLOT_X, SLOT_X, SLOT_DN, D);
+            }
+            nt_metal_batch_commit();
+            nt_metal_slot_download(SLOT_X, s->x, D*4);
+            resident_done = 1;
+            if (getenv("DOE_DEBUG_TIMING") && pos == 0)
+                fprintf(stderr, "[resident] engaged: whole token in 1 command buffer (%d layers)\n",
+                        ps->host_n_layers);
+        }
+    }
+#endif
+
+    for (int l = 0; !resident_done && l < ps->host_n_layers && l < MAX_LAYERS; l++) {
         if (!ps->host_layers[l].wq) continue;
 
         /* ── Host attention ── */
@@ -3278,6 +3403,7 @@ static void chat(GGUFIndex *ps) {
 
         struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
         g_prof_mv_ns = 0; /* reset: matvec profile over decode loop only (exclude prefill) */
+        for (int _g = 0; _g < MVG_N; _g++) { g_ps_ns[_g] = 0; g_ps_cnt[_g] = 0; }
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
             _gi = i + 1;
             float *lg = doe_forward(ps, &is, prev, pos);
@@ -3384,6 +3510,15 @@ static void chat(GGUFIndex *ps) {
                 double _mv = g_prof_mv_ns / 1e9;
                 fprintf(stderr, "[profile] matvec %.2fs (%.0f%% of decode) | rest %.2fs (attention/rmsnorm/FFN/sample)\n",
                         _mv, _el > 0 ? 100 * _mv / _el : 0.0, _el - _mv);
+            }
+            if (g_ps_on > 0 && _gi > 0) {
+                static const char *_gn[MVG_N] = {"attn_qkv","attn_o","ffn_gate_up","ffn_down","lm_head"};
+                double _tot = 0; for (int _g = 0; _g < MVG_N; _g++) _tot += g_ps_ns[_g];
+                fprintf(stderr, "[per-shape] %d tokens, per-token (bytes-share check):\n", _gi);
+                for (int _g = 0; _g < MVG_N; _g++)
+                    fprintf(stderr, "  %-12s %.3f ms/tok  %.1f disp/tok  (m=%d k=%d dt=%d)  %.0f%% time\n",
+                            _gn[_g], g_ps_ns[_g]/1e6/_gi, (double)g_ps_cnt[_g]/_gi,
+                            g_ps_m[_g], g_ps_k[_g], g_ps_dt[_g], _tot > 0 ? 100*g_ps_ns[_g]/_tot : 0.0);
             }
         }
         printf("\n");
