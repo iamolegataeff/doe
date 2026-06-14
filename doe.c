@@ -2942,9 +2942,27 @@ static int sample(float *logits, int V, float temp, int top_k) {
     if (temp <= 0) { int b = 0; for (int i = 1; i < V; i++) if (logits[i] > logits[b]) b = i; return b; }
     for (int i = 0; i < V; i++) logits[i] /= temp;
     if (top_k > 0 && top_k < V) {
-        float *s = malloc(V*4); memcpy(s, logits, V*4);
-        for (int i = 0; i < top_k; i++) { int b = i; for (int j = i+1; j < V; j++) if (s[j] > s[b]) b = j; float t = s[i]; s[i] = s[b]; s[b] = t; }
-        float th = s[top_k-1]; free(s);
+        /* threshold = top_k-th largest logit via a size-k min-heap: O(V log k),
+         * no per-token malloc. Root holds the smallest of the k kept = same
+         * threshold the old O(k*V) selection-sort produced (value is identical
+         * regardless of tie-breaking), so the sampled token is bit-identical. */
+        float heap[256]; int hk = top_k > 256 ? 256 : top_k; int n = 0;
+        for (int i = 0; i < V; i++) {
+            float v = logits[i];
+            if (n < hk) {
+                int c = n++; heap[c] = v;
+                while (c > 0) { int p=(c-1)/2; if (heap[p] <= heap[c]) break;
+                               float t=heap[p]; heap[p]=heap[c]; heap[c]=t; c=p; }
+            } else if (v > heap[0]) {
+                heap[0] = v; int c = 0;
+                for (;;) { int l=2*c+1, r=2*c+2, m=c;
+                           if (l<hk && heap[l]<heap[m]) m=l;
+                           if (r<hk && heap[r]<heap[m]) m=r;
+                           if (m==c) break;
+                           float t=heap[m]; heap[m]=heap[c]; heap[c]=t; c=m; }
+            }
+        }
+        float th = heap[0];
         for (int i = 0; i < V; i++) if (logits[i] < th) logits[i] = -1e30f;
     }
     softmax_n(logits, V);
