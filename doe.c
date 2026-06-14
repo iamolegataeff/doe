@@ -1248,6 +1248,7 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
  * (doe_qmatvec_i8, NEON SDOT) — APPROXIMATE; default is the exact dequant-inline path. */
 static int g_doe_int8 = -1;
 static double g_prof_mv_ns = 0; static int g_prof_on = -1; /* DOE_PROFILE: matvec share of decode */
+static double g_resident_ns = 0, g_head_ns = 0;  /* DOE_PROFILE: resident CB vs lm_head split */
 /* DOE_PERSHAPE: per-group matvec timing (Mythos M3 geometry input). Groups keyed
  * by (m,k) against model dims set at forward start. Sync path only (DOE_NO_SLOTS+
  * DOE_NO_BATCH) so each matvec is timed individually. */
@@ -2643,6 +2644,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                   (gdt==12||gdt==14)&&(udt==12||udt==14)&&(ddt==12||ddt==14))) { eligible = 0; break; }
         }
         if (eligible) {
+            struct timespec _r0; clock_gettime(CLOCK_MONOTONIC, &_r0);
             int qn = ps->host_heads * hd;
             nt_metal_slot_alloc(SLOT_X, D*4);  nt_metal_slot_alloc(SLOT_FN, D*4);
             nt_metal_slot_alloc(SLOT_Q, qn*4); nt_metal_slot_alloc(SLOT_K, kd*4);
@@ -2706,6 +2708,8 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
             nt_metal_batch_commit();
             nt_metal_slot_download(SLOT_X, s->x, D*4);
             resident_done = 1;
+            struct timespec _r1; clock_gettime(CLOCK_MONOTONIC, &_r1);
+            g_resident_ns += (_r1.tv_sec-_r0.tv_sec)*1e9 + (_r1.tv_nsec-_r0.tv_nsec);
             if (getenv("DOE_DEBUG_TIMING") && pos == 0)
                 fprintf(stderr, "[resident] engaged: whole token in 1 command buffer (%d layers)\n",
                         ps->host_n_layers);
@@ -2905,8 +2909,11 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     }
 
     /* Final norm + LM head */
+    struct timespec _h0; clock_gettime(CLOCK_MONOTONIC, &_h0);
     rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
     doe_mv(s->logits, ps->host_output, ps->host_output_dt, s->x, ps->host_vocab, D);
+    struct timespec _h1; clock_gettime(CLOCK_MONOTONIC, &_h1);
+    g_head_ns += (_h1.tv_sec-_h0.tv_sec)*1e9 + (_h1.tv_nsec-_h0.tv_nsec);
 
     return s->logits;
 }
@@ -3402,7 +3409,7 @@ static void chat(GGUFIndex *ps) {
         int total_births = 0, total_deaths = 0;
 
         struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
-        g_prof_mv_ns = 0; /* reset: matvec profile over decode loop only (exclude prefill) */
+        g_prof_mv_ns = 0; g_resident_ns = 0; g_head_ns = 0; /* reset: profile over decode loop only (exclude prefill) */
         for (int _g = 0; _g < MVG_N; _g++) { g_ps_ns[_g] = 0; g_ps_cnt[_g] = 0; }
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
             _gi = i + 1;
@@ -3510,6 +3517,10 @@ static void chat(GGUFIndex *ps) {
                 double _mv = g_prof_mv_ns / 1e9;
                 fprintf(stderr, "[profile] matvec %.2fs (%.0f%% of decode) | rest %.2fs (attention/rmsnorm/FFN/sample)\n",
                         _mv, _el > 0 ? 100 * _mv / _el : 0.0, _el - _mv);
+                double _res = g_resident_ns/1e9, _hd = g_head_ns/1e9;
+                fprintf(stderr, "[profile] resident-CB %.2fs (%.0f%%, %.1f ms/tok) | lm_head+norm %.2fs (%.0f%%, %.1f ms/tok) | other %.2fs\n",
+                        _res, _el>0?100*_res/_el:0.0, _gi>0?_res*1e3/_gi:0.0,
+                        _hd, _el>0?100*_hd/_el:0.0, _gi>0?_hd*1e3/_gi:0.0, _el-_res-_hd);
             }
             if (g_ps_on > 0 && _gi > 0) {
                 static const char *_gn[MVG_N] = {"attn_qkv","attn_o","ffn_gate_up","ffn_down","lm_head"};
