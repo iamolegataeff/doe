@@ -197,6 +197,104 @@ kernel void q4k_matvec_sg(
     if (lane == 0) out[tpig.y] = total;
 }
 
+/* q4k_matvec_v3 — bandwidth-optimal Q4_K matvec ported from llama.cpp
+ * kernel_mul_mv_q4_K_f32 (240 GB/s class on Apple GPUs). Wins over naive/M3-sg:
+ * multi-row (NR0=2 rows per simdgroup), activation held in registers and reused
+ * across both rows, float4-vectorized nibble unpack, sumy precompute for dmin.
+ * Single-x matvec; our packed Q4_K block is 144 bytes (d/dmin half, scales[12],
+ * qs[128]) — layout-identical to llama's block_q4_K. */
+kernel void q4k_matvec_v3(
+    device const uchar *W   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant     uint  &k   [[buffer(3)]],
+    constant     uint  &m   [[buffer(4)]],
+    uint3  tgpig            [[threadgroup_position_in_grid]],
+    ushort tiisg           [[thread_index_in_simdgroup]],
+    ushort sgitg           [[simdgroup_index_in_threadgroup]])
+{
+    const short NSG = 2;     /* simdgroups per threadgroup */
+    const short NR0 = 2;     /* rows per simdgroup */
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;   /* 0..3 */
+    const short it = tiisg % 8;   /* 0..7 */
+    const short iq = it / 4;      /* 0 or 1 */
+    const short ir = it % 4;      /* 0..3 */
+
+    const uint nb        = k / 256u;
+    const uint row_bytes = nb * 144u;        /* bytes per Q4_K row */
+    const uint row_u16   = row_bytes / 2u;   /* row stride in uint16 units */
+    const int  first_row = ((int)tgpig.x * NSG + sgitg) * NR0;
+    if (first_row >= (int)m) return;   /* tail threadgroup owns no rows (Codex: OOB W guard) */
+
+    device const uchar *x0 = W + (uint)first_row * row_bytes;
+    device const float *y4 = x + ix * 256u + 64u * iq + 8u * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[NR0] = {0.f, 0.f};
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        device const uchar    *blk = x0 + ib * 144u;
+        device const uint16_t *sc  = (device const uint16_t *)(blk + 4)  + iq;
+        device const uint16_t *q1  = (device const uint16_t *)(blk + 16) + 16 * iq + 4 * ir;
+        device const half     *dh  = (device const half *)blk;
+
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)m) break;   /* tail row: skip OOB W loads (Codex) */
+            sc16[0] =  sc[0] & kmask1;
+            sc16[1] =  sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t *q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += (float)dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                         (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                         (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                         (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         (float)dh[1] * (sumy[0]*sc8[2] + sumy[1]*sc8[3] + sumy[2]*sc8[6] + sumy[3]*sc8[7]);
+
+            q1 += row_u16;
+            sc += row_u16;
+            dh += row_u16;
+        }
+
+        y4 += 4 * 256;
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        if (first_row + row >= (int)m) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) out[first_row + row] = sum_all;
+    }
+}
+
 kernel void q6k_matvec_sg(
     device const uchar *W   [[buffer(0)]],
     device const float *x   [[buffer(1)]],
@@ -238,6 +336,88 @@ kernel void q6k_matvec_sg(
     }
     float total = simd_sum(acc);
     if (lane == 0) out[tpig.y] = total;
+}
+
+/* v3 multi-row Q6_K — llama kernel_mul_mv_q6_K port under our single-x ABI.
+ * Same geometry as q4k_matvec_v3 (NSG simdgroups x NR0 rows), but the Q6_K
+ * lane split differs (tid=tiisg/2, ix=tiisg%2 — two block subsets per tid)
+ * and the 6-bit weight is reassembled from ql (4 low bits) + qh (2 high
+ * bits), centred by -32. block_q6_K = ql[128] qh[64] scales[16 int8] d[half]
+ * = 210 bytes. Reductions are fixed simd_sum trees: deterministic. */
+kernel void q6k_matvec_v3(
+    device const uchar *W   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant     uint  &k   [[buffer(3)]],
+    constant     uint  &m   [[buffer(4)]],
+    uint3  tgpig            [[threadgroup_position_in_grid]],
+    ushort tiisg           [[thread_index_in_simdgroup]],
+    ushort sgitg           [[simdgroup_index_in_threadgroup]])
+{
+    const short NSG = 2;     /* simdgroups per threadgroup */
+    const short NR0 = 2;     /* rows per simdgroup */
+    constexpr uint8_t kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
+
+    const uint nb        = k / 256u;
+    const uint row_bytes = nb * 210u;        /* bytes per Q6_K row */
+    const int  first_row = ((int)tgpig.x * NSG + sgitg) * NR0;
+    if (first_row >= (int)m) return;   /* tail threadgroup owns no rows (Codex: OOB W guard) */
+
+    const short tid = tiisg / 2;     /* 0..15 */
+    const short ix  = tiisg % 2;     /* 0 or 1 — alternating block subsets */
+    const short ip  = tid / 8;       /* 0 or 1 */
+    const short il  = tid % 8;       /* 0..7 */
+    const short l0  = 4 * il;
+    const short is  = 8 * ip + l0 / 16;
+    const short y_offset   = 128 * ip + l0;
+    const short q_offset_l =  64 * ip + l0;
+    const short q_offset_h =  32 * ip + l0;
+
+    device const uchar *x0 = W + (uint)first_row * row_bytes;
+
+    float yl[16];
+    float sumf[NR0] = {0.f, 0.f};
+
+    for (uint i = ix; i < nb; i += 2) {
+        device const float *y = x + i * 256u + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        device const uchar  *blk = x0 + i * 210u;
+        device const uint8_t *q1 = (device const uint8_t *)(blk +   0) + q_offset_l;
+        device const uint8_t *q2 = q1 + 32;
+        device const uint8_t *qh = (device const uint8_t *)(blk + 128) + q_offset_h;
+        device const int8_t  *sc = (device const int8_t  *)(blk + 192) + is;
+        device const half    *dh = (device const half    *)(blk + 208);
+
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)m) break;   /* tail row: skip OOB W loads (Codex) */
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+            sumf[row] += (float)dh[0] * (sums[0]*sc[0] + sums[1]*sc[2] + sums[2]*sc[4] + sums[3]*sc[6]);
+
+            q1 += row_bytes;
+            q2 += row_bytes;
+            qh += row_bytes;
+            sc += row_bytes;
+            dh += row_bytes / 2u;   /* half units */
+        }
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        if (first_row + row >= (int)m) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) out[first_row + row] = sum_all;
+    }
 }
 
 /* ── M4 — layer ops: the CPU fence-posts move onto the GPU ──────────────
@@ -426,8 +606,12 @@ static id<MTLCommandQueue>         g_queue       = nil;
 static id<MTLComputePipelineState> g_q4k_pipe    = nil;
 static id<MTLComputePipelineState> g_q6k_pipe    = nil;
 static id<MTLComputePipelineState> g_q4k_sg_pipe = nil;   /* M3 simdgroup path */
+static id<MTLComputePipelineState> g_q4k_v3_pipe = nil;   /* v3 multi-row Q4_K (llama port) */
+static id<MTLComputePipelineState> g_q6k_v3_pipe = nil;   /* v3 multi-row Q6_K (llama port) */
 static id<MTLComputePipelineState> g_q6k_sg_pipe = nil;
-static int                         g_use_sg      = 1;     /* NT_METAL_NAIVE=1 -> 0 */
+static int                         g_use_sg      = 0;     /* 0 naive | 1 sg | 2 per-format auto (set in init) */
+static int                         g_use_v3      = 0;     /* 1 = v3 multi-row Q4_K (NT_METAL_V3) */
+static int                         g_use_v3_q6   = 0;     /* 1 = v3 multi-row Q6_K (NT_METAL_V3, unless NT_METAL_V3_NOQ6) */
 static id<MTLComputePipelineState> g_rms_pipe    = nil;   /* M4 layer ops */
 static id<MTLComputePipelineState> g_rope_pipe   = nil;
 static id<MTLComputePipelineState> g_silu_pipe   = nil;
@@ -548,6 +732,21 @@ int nt_metal_init(void)
                     err ? err.localizedDescription.UTF8String : "(no error)");
             return 5;
         }
+        /* v3 multi-row Q4_K (optional — falls back to naive/sg if absent) */
+        id<MTLFunction> fn4v = [lib newFunctionWithName:@"q4k_matvec_v3"];
+        if (fn4v) {
+            g_q4k_v3_pipe = [g_device newComputePipelineStateWithFunction:fn4v error:&err];
+            if (!g_q4k_v3_pipe)
+                fprintf(stderr, "nt_metal_init: q4k_v3 pipeline state failed: %s\n",
+                        err ? err.localizedDescription.UTF8String : "(no error)");
+        }
+        id<MTLFunction> fn6v = [lib newFunctionWithName:@"q6k_matvec_v3"];
+        if (fn6v) {
+            g_q6k_v3_pipe = [g_device newComputePipelineStateWithFunction:fn6v error:&err];
+            if (!g_q6k_v3_pipe)
+                fprintf(stderr, "nt_metal_init: q6k_v3 pipeline state failed: %s\n",
+                        err ? err.localizedDescription.UTF8String : "(no error)");
+        }
         /* M4 layer-op pipelines */
         struct { NSString *name; id<MTLComputePipelineState> __strong *slot; } m4ops[] = {
             { @"rmsnorm_f32",     &g_rms_pipe  },
@@ -567,13 +766,25 @@ int nt_metal_init(void)
                 return 5;
             }
         }
-        /* Default = naive one-thread-per-row. The 24B doe A/B on M4 Pro
-         * (2026-06-12) measured sg at -23% on the real mixed-shape decode
-         * stream (280 matvecs/token, attn k/v down to 1024x5120) despite
-         * x1.81 on the square resident microbench. NT_METAL_SG=1 opts in
-         * for geometry tuning; NT_METAL_NAIVE=1 still forces naive. */
+        /* Kernel choice defaults to naive: the per-format split (Q6_K -> sg)
+         * is tuned on A18 (doe-mix per-shape A/B: ffn down x1.48, lm_head x1.61)
+         * and does NOT transfer to M4 Pro, where a clean one-binary A/B has
+         * naive fastest (median t/s 4.24 naive > 3.57 auto > 3.24 all-sg).
+         * NT_METAL_AUTO=1 opts in to the per-format split (the A18 win),
+         * NT_METAL_SG=1 forces sg everywhere, NT_METAL_NAIVE=1 forces naive
+         * and wins over both. */
         g_use_sg = getenv("NT_METAL_SG") ? 1 : 0;
+        if (getenv("NT_METAL_AUTO")) g_use_sg = 2;         /* per-format: sg on Q6_K only */
         if (getenv("NT_METAL_NAIVE")) g_use_sg = 0;
+        g_use_v3 = getenv("NT_METAL_V3") ? 1 : 0;          /* v3 multi-row Q4_K — WINS on M4 Pro (gate+up +20%) */
+        /* q6k v3 is a SEPARATE opt-in (NT_METAL_V3_Q6=1), default OFF. A clean
+         * same-binary A/B on M4 Pro (tool b80lte1bv): naive 4.21 < q4k-v3-only
+         * 5.18, but q4k+q6k-v3 drops to 3.81 — the multi-row q6k geometry LOSES
+         * to naive for the Q6_K forms (ffn_down m=5120, byte-wise 6-bit unpack,
+         * not vectorised like q4k). Same lesson as the sg path: A18 multi-row
+         * wins do not transfer to M4 Pro. Kept correct + opt-in for A18/future
+         * geometry work; NT_METAL_V3=1 alone keeps the clean q4k-only win. */
+        g_use_v3_q6 = getenv("NT_METAL_V3_Q6") ? 1 : 0;
     }
 
     g_initialised = 1;
@@ -594,6 +805,8 @@ void nt_metal_shutdown(void)
     g_q4k_pipe    = nil;
     g_q6k_pipe    = nil;
     g_q4k_sg_pipe = nil;
+    g_q4k_v3_pipe = nil;
+    g_q6k_v3_pipe = nil;
     g_q6k_sg_pipe = nil;
     g_rms_pipe = nil; g_rope_pipe = nil; g_silu_pipe = nil;
     g_add_pipe = nil; g_attn_pipe = nil; g_copy_pipe = nil;
@@ -756,13 +969,33 @@ static int encode_matvec(id<MTLComputePipelineState> pipe, NSUInteger block_byte
         if (!cb || !enc) { fprintf(stderr, "nt_metal: encoder alloc failed\n"); return 11; }
     }
 
-    /* M3: simdgroup path by default — one 32-lane simdgroup per row, grid
-     * (32, m), each threadgroup y-line is one simdgroup. NT_METAL_NAIVE=1
-     * keeps the one-thread-per-row reference geometry. */
+    /* M3 simdgroup geometry — one 32-lane simdgroup per row, grid (32, m),
+     * each threadgroup y-line is one simdgroup. Auto mode picks it for
+     * Q6_K only; see nt_metal_init for the per-format A/B. */
     id<MTLComputePipelineState> sg_pipe =
         (block_bytes == 144u) ? g_q4k_sg_pipe : g_q6k_sg_pipe;
+    id<MTLComputePipelineState> v3_pipe =
+        (block_bytes == 144u) ? g_q4k_v3_pipe :
+        (block_bytes == 210u) ? g_q6k_v3_pipe : nil;
     uint32_t k_u32 = (uint32_t)k;
-    if (g_use_sg && sg_pipe) {
+    int sg_on = sg_pipe && (g_use_sg == 1 || (g_use_sg == 2 && block_bytes == 210u));
+    int v3_on = v3_pipe && ((block_bytes == 144u) ? g_use_v3 : g_use_v3_q6);
+    if (v3_on) {
+        /* v3 multi-row (Q4_K and Q6_K): NSG simdgroups x NR0 rows each. Kernel
+         * uses threadgroup_position_in_grid, so dispatchThreadgroups (not
+         * Threads). setBytes m at index 4 for row bounds (tail threadgroup). */
+        uint32_t m_u32 = (uint32_t)m;
+        const NSUInteger NSG = 2u, NR0 = 2u;
+        NSUInteger ntg = ((NSUInteger)m + (NSG*NR0) - 1u) / (NSG*NR0);
+        [enc setComputePipelineState:v3_pipe];
+        [enc setBuffer:bW          offset:W_off atIndex:0];
+        [enc setBuffer:g_arena_in  offset:x_off atIndex:1];
+        [enc setBuffer:g_arena_out offset:o_off atIndex:2];
+        [enc setBytes:&k_u32 length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&m_u32 length:sizeof(uint32_t) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(ntg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32u*NSG, 1, 1)];
+    } else if (sg_on) {
         [enc setComputePipelineState:sg_pipe];
         [enc setBuffer:bW          offset:W_off atIndex:0];
         [enc setBuffer:g_arena_in  offset:x_off atIndex:1];
@@ -1183,7 +1416,24 @@ static int matvec_slot(id<MTLComputePipelineState> naive_pipe,
         id<MTLCommandBuffer> cb; id<MTLComputeCommandEncoder> enc;
         int rc = op_enc(&cb, &enc); if (rc) return rc;
         uint32_t k_u32 = (uint32_t)k;
-        if (g_use_sg && sg_pipe) {
+        id<MTLComputePipelineState> v3_pipe =
+            (block_bytes == 144u) ? g_q4k_v3_pipe :
+            (block_bytes == 210u) ? g_q6k_v3_pipe : nil;
+        int sg_on = sg_pipe && (g_use_sg == 1 || (g_use_sg == 2 && block_bytes == 210u));
+        int v3_on = v3_pipe && ((block_bytes == 144u) ? g_use_v3 : g_use_v3_q6);
+        if (v3_on) {
+            uint32_t m_u32 = (uint32_t)m;
+            const NSUInteger NSG = 2u, NR0 = 2u;
+            NSUInteger ntg = ((NSUInteger)m + (NSG*NR0) - 1u) / (NSG*NR0);
+            [enc setComputePipelineState:v3_pipe];
+            [enc setBuffer:bW offset:W_off atIndex:0];
+            [enc setBuffer:g_slot_buf offset:g_slot_tab[src_slot].off atIndex:1];
+            [enc setBuffer:g_slot_buf offset:g_slot_tab[dst_slot].off atIndex:2];
+            [enc setBytes:&k_u32 length:4 atIndex:3];
+            [enc setBytes:&m_u32 length:4 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(ntg, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32u*NSG, 1, 1)];
+        } else if (sg_on) {
             [enc setComputePipelineState:sg_pipe];
             [enc setBuffer:bW offset:W_off atIndex:0];
             [enc setBuffer:g_slot_buf offset:g_slot_tab[src_slot].off atIndex:1];
