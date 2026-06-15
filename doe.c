@@ -1572,6 +1572,7 @@ typedef struct {
     int     bos_id, eos_id; /* special tokens */
     int     add_space_prefix;
     int     is_gpt2_bpe;    /* 1 if tokenizer.ggml.model == "gpt2" */
+    int     is_tekken;      /* 1 if tokenizer.ggml.pre == "tekken" */
 
     /* GPT-2 BPE merges (used to build scores if no native scores) */
     char  **bpe_merges;     /* merge strings "A B" */
@@ -1825,6 +1826,10 @@ static int index_load(GGUFIndex *ps, const char *path) {
             if (strstr(key, "tokenizer.ggml.model") && vlen < 20) {
                 char tok_model[24]; memcpy(tok_model, p, vlen); tok_model[vlen] = 0;
                 if (strcmp(tok_model, "gpt2") == 0) ps->is_gpt2_bpe = 1;
+            }
+            if (strstr(key, "tokenizer.ggml.pre") && vlen < 64) {
+                char tok_pre[64]; memcpy(tok_pre, p, vlen); tok_pre[vlen] = 0;
+                if (strcmp(tok_pre, "tekken") == 0) ps->is_tekken = 1;
             }
             /* DOE identity fingerprint — this GGUF is DOE's own */
             if (strcmp(key, "doe.identity") == 0 && vlen < 128) {
@@ -2146,8 +2151,10 @@ static int index_load(GGUFIndex *ps, const char *path) {
     printf("[doe] rope_theta=%.0f rms_eps=%.1e bias=%s\n",
            ps->rope_theta, ps->rms_norm_eps,
            ps->host_layers[0].bq ? "yes" : "no");
-    if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE (%d merges)\n", ps->n_bpe_merges);
+    if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE%s (%d merges)\n", ps->is_tekken ? "/Tekken" : "", ps->n_bpe_merges);
     /* Auto-detect nanollama chat style from identity tag or vocab tokens */
+    if (ps->chat_style == 0 && ps->is_tekken && tok_lookup(ps, "[INST]", 6) >= 0)
+        ps->chat_style = 2;
     if (ps->chat_style == 0 && (ps->identity_tag[0] ||
         tok_lookup(ps, "<|user_start|>", 14) >= 0)) ps->chat_style = 6;
     { const char *cs[] = {"raw","chatml","inst","zephyr","phi","gemma","nanollama"};
