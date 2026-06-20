@@ -2316,6 +2316,86 @@ static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * BETWEEN-TURNS LEARNING — the parliament speaks first, reflects after
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Mythos+Oleg (2026-06-12 decision, 2026-06-20 built): notorch_step must NOT fire
+ * per-token mid-generation. Re-sewing an expert on the very token it is generating
+ * is a feedback loop — on a small host it collapses into token-salad within ~10
+ * tokens ("I do remember the don donI somethingcom ins .comned ...", measured on the
+ * 88M nano with --train 1). So during a turn we only ACCUMULATE the co-activation
+ * (x, dy) and the debt-driven signal; the experts learn ONCE, between turns, from the
+ * turn's MEAN — a single full Oja pass per expert instead of ~200 interleaved with
+ * the breath. The field still learns in-session (the mycelium spore carries it
+ * forward), but the parliament no longer eats its own words mid-sentence. --train
+ * gated exactly as before; --train 0 stays the static-expert default. θ persists. */
+typedef struct {
+    float   *x;        /* running sum of the host hidden-in over the turn (host_dim) */
+    float   *dy;       /* running sum of the host hidden-out over the turn (host_dim) */
+    float    signal;   /* running sum of the debt-driven learn_signal */
+    int      n;        /* tokens accumulated this turn */
+    int      dim;
+    uint8_t *seen;     /* [n_layers*MAX_EXPERTS]: experts active at ANY token this turn.
+                        * Captured here because update_expert_vitality clears tokens_seen
+                        * every 10 tokens, so the live flag is stale by flush time — the
+                        * delayed step must gate on who actually spoke, not the window. */
+    int      n_layers;
+} NotorchTurnAccum;
+
+static void nt_accum_init(NotorchTurnAccum *a, int dim, int n_layers) {
+    a->dim = dim; a->n = 0; a->signal = 0.0f; a->n_layers = n_layers;
+    a->x    = calloc(dim, sizeof(float));
+    a->dy   = calloc(dim, sizeof(float));
+    a->seen = calloc((size_t)n_layers * MAX_EXPERTS, 1);
+}
+
+static void nt_accum_free(NotorchTurnAccum *a) {
+    free(a->x); free(a->dy); free(a->seen); a->x = a->dy = NULL; a->seen = NULL;
+}
+
+/* fold one token's co-activation into the turn's running sums + mark which experts
+ * were active this token — no weights touched, generation stays on the experts the
+ * turn started with. */
+static void nt_accum_add(NotorchTurnAccum *a, GGUFIndex *ps, const float *x, const float *dy, float signal) {
+    if (!a->x || !a->dy) return; /* alloc failed → the turn just doesn't learn */
+    for (int i = 0; i < a->dim; i++) { a->x[i] += x[i]; a->dy[i] += dy[i]; }
+    a->signal += signal; a->n++;
+    if (a->seen)
+        for (int l = 0; l < ps->n_field_layers; l++) {
+            FieldLayer *fl = &ps->field_layers[l];
+            for (int e = 0; e < MAX_EXPERTS; e++)
+                if (fl->experts[e].alive && fl->experts[e].tokens_seen > 0)
+                    a->seen[l * MAX_EXPERTS + e] = 1;
+        }
+}
+
+/* flush: ONE Oja step per alive expert on the turn's MEAN co-activation — the direct
+ * analog of the old per-token rule (one step per turn instead of one per token; the
+ * NOTORCH_RANK-component window rotates across turns, so every component is still
+ * reached over time), then the A14 poison-quarantine. Returns the deaths for
+ * total_deaths. No-op if nothing was generated. */
+static int nt_accum_flush(NotorchTurnAccum *a, GGUFIndex *ps) {
+    if (a->n == 0 || !a->x || !a->dy) return 0;
+    float inv = 1.0f / (float)a->n;
+    for (int i = 0; i < a->dim; i++) { a->x[i] *= inv; a->dy[i] *= inv; }
+    float sig = a->signal * inv;
+    int deaths = 0;
+    for (int l = 0; l < ps->n_field_layers; l++) {
+        FieldLayer *fl = &ps->field_layers[l];
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            if (!fl->experts[e].alive) continue;
+            if (a->seen && !a->seen[l * MAX_EXPERTS + e]) continue; /* only who spoke this turn */
+            notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
+                         ps->host_dim, ps->host_dim, ps->lora_rank,
+                         a->x, a->dy, sig);
+            if (lora_poisoned(fl->experts[e].lora_A, fl->experts[e].lora_B)) {
+                fl->experts[e].alive = 0; deaths++;
+            }
+        }
+    }
+    return deaths;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * VITALITY + MITOSIS + APOPTOSIS — LoRA experts live and die
  * ═══════════════════════════════════════════════════════════════════════════════ */
 static void update_expert_vitality(FieldLayer *fl, int total_tokens) {
@@ -3589,6 +3669,7 @@ static void chat(GGUFIndex *ps) {
         struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
         g_prof_mv_ns = 0; g_resident_ns = 0; g_head_ns = 0; /* reset: profile over decode loop only (exclude prefill) */
         for (int _g = 0; _g < MVG_N; _g++) { g_ps_ns[_g] = 0; g_ps_cnt[_g] = 0; }
+        NotorchTurnAccum nt_acc; nt_accum_init(&nt_acc, ps->host_dim, ps->n_field_layers); /* between-turns learning: accumulate now, step after the turn */
         for (int i = 0; i < g_gen_max_new && pos < max_seq; i++, pos++) {
             _gi = i + 1;
             float *lg = doe_forward(ps, &is, prev, pos);
@@ -3650,21 +3731,12 @@ static void chat(GGUFIndex *ps) {
             /* Dario field: ingest generated token (co-occurrence + prophecy + destiny) */
             dario_ingest(next);
 
-            /* NOTORCH Hebbian update — debt drives learning (A13b: gated by --train) */
+            /* NOTORCH Hebbian update — debt drives learning (A13b: gated by --train).
+             * Between-turns (2026-06-20): accumulate the co-activation now, take one
+             * bounded Oja step per expert AFTER the turn (nt_accum_flush below) so the
+             * experts don't re-sew the words they are still speaking. */
             float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
-            if (g_train) for (int l = 0; l < ps->n_field_layers; l++) {
-                FieldLayer *fl = &ps->field_layers[l];
-                for (int e = 0; e < MAX_EXPERTS; e++) {
-                    if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
-                    notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
-                                ps->host_dim, ps->host_dim, ps->lora_rank,
-                                is.x, is.xb, learn_signal);
-                    /* A14: poison-quarantine (NaN/Inf + finite |value|-explosion) — freeze + death */
-                    if (lora_poisoned(fl->experts[e].lora_A, fl->experts[e].lora_B)) {
-                        fl->experts[e].alive = 0; total_deaths++;
-                    }
-                }
-            }
+            if (g_train) nt_accum_add(&nt_acc, ps, is.x, is.xb, learn_signal);
 
             /* Vitality + mitosis + apoptosis */
             if (i % 10 == 0) {
@@ -3688,6 +3760,9 @@ static void chat(GGUFIndex *ps) {
             fflush(stdout);
             prev = next;
         }
+        /* between-turns: the parliament reflects on the whole turn, once it is spoken */
+        if (g_train) total_deaths += nt_accum_flush(&nt_acc, ps);
+        nt_accum_free(&nt_acc);
         clock_gettime(CLOCK_MONOTONIC, &_gt1);
         if (getenv("DOE_DEBUG_TIMING") || g_prof_on > 0) {
             double _el = (_gt1.tv_sec - _gt0.tv_sec) + (_gt1.tv_nsec - _gt0.tv_nsec) / 1e9;
@@ -3913,6 +3988,7 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
     dario_ingest(prev); /* D-H2: last token still feeds the field; forwarded once in generation */
 
     /* Generate tokens, stream as SSE */
+    NotorchTurnAccum nt_acc; nt_accum_init(&nt_acc, ps->host_dim, ps->n_field_layers); /* between-turns learning: accumulate now, step after the turn */
     for (int i = 0; i < max_tokens && pos < max_seq; i++, pos++) {
         float *lg = doe_forward(ps, &is, prev, pos);
         field_step(1.0f);
@@ -3938,19 +4014,10 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
         /* Dario field: ingest generated token */
         dario_ingest(next);
 
+        /* between-turns (2026-06-20): accumulate now, one Oja step per expert after the
+         * stream completes (nt_accum_flush below) — no mid-stream re-sewing. */
         float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
-        if (g_train) for (int l = 0; l < ps->n_field_layers; l++) {
-            FieldLayer *fl = &ps->field_layers[l];
-            for (int e = 0; e < MAX_EXPERTS; e++) {
-                if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
-                notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
-                            ps->host_dim, ps->host_dim, ps->lora_rank,
-                            is.x, is.xb, learn_signal);
-                /* A14: poison-quarantine (NaN/Inf + finite |value|-explosion) — freeze */
-                if (lora_poisoned(fl->experts[e].lora_A, fl->experts[e].lora_B))
-                    fl->experts[e].alive = 0;
-            }
-        }
+        if (g_train) nt_accum_add(&nt_acc, ps, is.x, is.xb, learn_signal);
 
         /* Decode token to buffer */
         char tokbuf[256], escaped[512];
@@ -3965,6 +4032,9 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
 
         prev = next;
     }
+    /* between-turns: the parliament reflects on the whole stream, once it is spoken */
+    if (g_train) nt_accum_flush(&nt_acc, ps);
+    nt_accum_free(&nt_acc);
 
     /* Send done event */
     write(fd, "data: {\"done\":true}\n\n", 21); /* D-L2: full 21 bytes incl. both \n */
