@@ -1349,6 +1349,16 @@ static void apply_rope_mode(float *v, int pos, float *cc, float *sc, int hd, int
     }
 }
 
+/* RoPE pairing per architecture, mirroring llama.cpp llama_model_rope_type()
+ * (src/llama-model.cpp): llama-family + Mistral use NORM (adjacent pairs 2i,2i+1);
+ * the qwen/falcon/gemma/phi/... family uses NEOX (offset-half pairs i,i+hd/2).
+ * GGUF permutes Q/K for whichever the arch expects, so the wrong mode is identity
+ * at pos 0 but corrupts rope progressively at pos>0 (coherent short, broken long). */
+static int arch_rope_norm(const char *arch) {
+    return strcmp(arch, "llama") == 0 || strcmp(arch, "mistral") == 0 ||
+           strcmp(arch, "mistral3") == 0 || strcmp(arch, "mistral4") == 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * HARMONIC RESONANCE ENGINE — from AML/DOE, adapted for field.
  * each expert has a frequency. input gets fourier-decomposed.
@@ -2881,7 +2891,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
                 if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
                 else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
-                int rope_norm = g_rope_norm || strcmp(ps->host_arch, "llama") == 0;
+                int rope_norm = g_rope_norm || arch_rope_norm(ps->host_arch);
                 nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta, rope_norm);
                 nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta, rope_norm);
                 nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
@@ -2986,7 +2996,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
                 if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
                 else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
-                int rope_norm = g_rope_norm || strcmp(ps->host_arch, "llama") == 0;
+                int rope_norm = g_rope_norm || arch_rope_norm(ps->host_arch);
                 nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta, rope_norm);
                 nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta, rope_norm);
                 nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
@@ -3026,7 +3036,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         if (ps->host_layers[l].bk) for (int i = 0; i < kd; i++) s->k[i] += ps->host_layers[l].bk[i];
         if (ps->host_layers[l].bv) for (int i = 0; i < kd; i++) s->v[i] += ps->host_layers[l].bv[i];
 
-        int rope_norm = g_rope_norm || strcmp(ps->host_arch, "llama") == 0;
+        int rope_norm = g_rope_norm || arch_rope_norm(ps->host_arch);
         for (int h = 0; h < ps->host_heads; h++) apply_rope_mode(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd, rope_norm);
         for (int h = 0; h < ps->host_kv_heads; h++) apply_rope_mode(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd, rope_norm);
 
