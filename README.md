@@ -276,6 +276,8 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 --destiny F        destiny injection strength (default 0.35)
 --lora-rank N      LoRA rank per expert (default 16)
 --lora-alpha F     injection strength (default 0.1)
+--image PATH       native Pixtral vision: encode an image and see it (mistral3, no llama.cpp)
+--mmproj PATH      Pixtral vision-tower GGUF (mmproj), required with --image
 ```
 
 ## supported formats
@@ -302,6 +304,7 @@ DOE auto-detects architecture parameters from GGUF metadata. No config files, no
 | Qwen2       | GPT-2 BPE | ChatML | Qwen2.5 0.5B/1.5B Q4_K | **working** |
 | SmolLM      | GPT-2 BPE | ChatML | SmolLM2 360M Q8 | **working** |
 | Mistral     | SentencePiece | [INST] | Mistral 7B Instruct Q4_K | **working** |
+| Mistral3    | Tekken BPE | [INST] | Mistral-Small-24B Q4_K + native Pixtral vision | **working** |
 | nanollama   | SentencePiece | nanollama | nano/micro/mini F16 | **working** |
 | Gemma       | SentencePiece | gemma | Gemma-2 2B Q4_K | loads, tied embeddings |
 | Phi-3       | SentencePiece | phi | Phi-3-mini 4K Q4 | fused QKV — TODO |
@@ -311,6 +314,8 @@ Architecture-specific handling:
 - **nanollama chat** — `<|user_start|>...<|user_end|><|assistant_start|>` template, auto-detected from vocab tokens.
 - **EOS detection** — stops on `<|im_end|>`, `<|end|>`, `<|endoftext|>`, `<end_of_turn>`, `<|assistant_end|>`, `<|eot_id|>`, model EOS token.
 - **RoPE frequency base** — parsed from `rope.freq_base` (Qwen2/Mistral use 1M vs standard 10K)
+- **RoPE pairing** — NORM (adjacent pairs `2i,2i+1`) for the llama/Mistral family, NEOX (offset-half `i,i+hd/2`) for the Qwen/Falcon/Gemma family, mirroring llama.cpp `llama_model_rope_type()` (the GGUF permutes Q/K for whichever the arch expects; the wrong mode is identity at pos 0 but corrupts progressively with position)
+- **native vision** (`mistral3`) — the Pixtral encoder reimplemented in pure C: preprocess → patch conv → ViT with 2D-RoPE → patch merger → GELU projector → IMG_BREAK, spliced into the forward at image positions. Zero llama.cpp at runtime (cblas + `gguf.c` + `stb_image.h`). Built into the BLAS/Metal targets (`make metal` / `make blas`); `--image`/`--mmproj`
 - **RMSNorm epsilon** — parsed from `layer_norm_rms_epsilon` (Qwen2 uses 1e-6 vs standard 1e-5)
 - **Attention biases** — Q/K/V biases loaded and applied when present (Qwen2)
 - **Tied embeddings** — `output.weight` reuses `token_embd.weight` when missing (Gemma)
