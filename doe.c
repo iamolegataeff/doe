@@ -4200,6 +4200,22 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
                     F.debt, F.field_health);
                 http_send_header(client, 200, "application/json", blen);
                 http_send(client, body, blen);
+            } else if (strcmp(path, "/logo.svg") == 0) {
+                /* DOE mark — central node + a hexagon of experts (Democracy of Experts) */
+                static const char *logo =
+                    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' width='32' height='32'>"
+                    "<rect width='32' height='32' rx='7' fill='#0d0d0d'/>"
+                    "<g stroke='#374151' stroke-width='1'>"
+                    "<line x1='16' y1='16' x2='16' y2='6.6'/><line x1='16' y1='16' x2='24.1' y2='11.3'/>"
+                    "<line x1='16' y1='16' x2='24.1' y2='20.7'/><line x1='16' y1='16' x2='16' y2='25.4'/>"
+                    "<line x1='16' y1='16' x2='7.9' y2='20.7'/><line x1='16' y1='16' x2='7.9' y2='11.3'/></g>"
+                    "<g fill='#9ca3af'>"
+                    "<circle cx='16' cy='6.6' r='2'/><circle cx='24.1' cy='11.3' r='2'/>"
+                    "<circle cx='24.1' cy='20.7' r='2'/><circle cx='16' cy='25.4' r='2'/>"
+                    "<circle cx='7.9' cy='20.7' r='2'/><circle cx='7.9' cy='11.3' r='2'/></g>"
+                    "<circle cx='16' cy='16' r='3.4' fill='#ffffff'/></svg>";
+                http_send_header(client, 200, "image/svg+xml", (int)strlen(logo));
+                http_send(client, logo, (int)strlen(logo));
             } else {
                 const char *msg = "not found";
                 http_send_header(client, 404, "text/plain", (int)strlen(msg));
