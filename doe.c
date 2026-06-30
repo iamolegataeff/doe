@@ -42,10 +42,19 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <dirent.h>
+#ifdef USE_METAL
+#include "notorch_metal.h"
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+/* ── native pixtral vision (inlined, punk one-file) — needs cblas (BLAS/metal builds) ── */
+#ifdef USE_BLAS
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "gguf.h"
+#endif
 #ifdef __linux__
   #include <sys/statvfs.h>
 #endif
@@ -124,6 +133,34 @@ static uint64_t rng_next(void) { rng_state ^= rng_state<<13; rng_state ^= rng_st
 static float rand_uniform(void) { return (float)(rng_next()&0x7FFFFFFF)/(float)0x7FFFFFFF; }
 static float rand_normal(void) { float u1=rand_uniform(),u2=rand_uniform(); if(u1<1e-10f)u1=1e-10f; return sqrtf(-2.0f*logf(u1))*cosf(6.2831853f*u2); }
 static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+static float g_field_gain = 1.0f; /* A11a: scale Dario field overlay on logits; 1.0 = full, 0 = bare host */
+static int g_train = 0; /* A13b/A14: notorch online-learning during inference; DEFAULT 0=off (Oleg+Mythos 2026-06-12: organism must not re-sew its own weights mid-sentence; online learning returns later as async between turns, ogemma vision); 1=on */
+static int g_gen_max_new = 200; /* bounded one-shot validation; default preserves old chat length */
+static int g_gen_top_k = 40;
+static float g_gen_temp_override = -1.0f; /* <0 uses field effective temperature */
+static int g_once = 0; /* exit after one generated answer; useful for artifact isolation */
+static int g_load_spore = 1;
+static int g_save_spore = 1;
+static int g_rope_norm = 0; /* probe: llama.cpp NORM RoPE pairs consecutive head values */
+static char g_image_path[512]  = {0}; /* --image: native pixtral vision (doe sees images, no llama.cpp) */
+static char g_mmproj_path[512] = {0}; /* --mmproj: pixtral vision-tower gguf */
+static char g_img_embeds_bin[512] = {0}; /* --img-embeds-bin: load image embeds [n_tok*host_dim] f32 (diagnostic: clip ground-truth vs native encoder) */
+#ifdef USE_BLAS
+float *pv_encode_image(const char *img_path, const char *mmproj_path, int *o_ntok, int *o_dim); /* native pixtral encoder, defined below (inlined punk) */
+#endif
+/* M4 slot ids for the FFN/attention half-layer chains on GPU (NT_SLOT_MAX=64). */
+enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB, SLOT_LOGITS,
+       /* DOE parliament-on-GPU (alpha != 0): election + LoRA inject inside the resident CB */
+       SLOT_PTMP, SLOT_PGATE, SLOT_PVOTES, SLOT_PRES, SLOT_PALIVE, SLOT_PCONS };
+/* A14: expert poison check — catches BOTH faces of notorch drift: NaN/Inf and finite |value|-explosion
+ * (the latter passes isfinite but still poisons the forward when injected at alpha>0). */
+static int lora_poisoned(const float *A, const float *B, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(A[i]) || !isfinite(B[i]) || fabsf(A[i]) > 1e4f || fabsf(B[i]) > 1e4f)
+            return 1; /* drift in ANY element poisons the forward, not just [0] */
+    }
+    return 0;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * AML FIELD STATE — the soul. from ariannamethod.c, distilled.
@@ -885,7 +922,7 @@ static void apply_field_to_logits(float *logits, int n) {
         float a_term = eff_gamma * A_sig[i];
         float t_term = (i < 50) ? t_boost * (1.0f - (float)i / 50.0f) : 0;
 
-        logits[i] += h_term + f_term + a_term + t_term;
+        logits[i] += g_field_gain * (h_term + f_term + a_term + t_term);
     }
 
     /* tau_mod feeds into effective temperature (applied in field_step) */
@@ -1054,6 +1091,7 @@ static void *matvec_worker(void *arg) {
 }
 
 static int g_n_threads = 0;
+static float g_rep_penalty = 1.0f; /* A10a: repetition penalty over generated history; 1.0 = off */
 
 static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #ifdef USE_CUBLAS
@@ -1092,19 +1130,249 @@ static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #endif
 }
 
+/* ── packed quantized matvec — vendored from notorch nt_qmatvec ──────────────────
+ * Keeps weights PACKED in RAM and dequantizes each block inline (no f32 blow-up).
+ * DoE stays a single file. dtype = GGUF code (1 f16, 2 Q4_0, 6 Q5_0, 8 Q8_0,
+ * 12 Q4_K, 14 Q6_K). Row kernels take [r0,r1) so they thread like matvec.
+ * Verified faithful to notorch (rel ~1e-6 vs dequant->cblas). reuses f16_to_f32. */
+static void pq_f16_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    const uint16_t *Wh = (const uint16_t*)W;
+    for (int row=r0; row<r1; row++) { const uint16_t *r = Wh + (size_t)row*c;
+        float a=0; for (int j=0;j<c;j++) a += f16_to_f32(r[j])*x[j]; out[row]=a; }
+}
+static void pq_q4_0_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const float *xb=x+(size_t)b*32;
+            for (int i=0;i<16;i++) { int lo=(int)(bl[2+i]&0x0F)-8, hi=(int)(bl[2+i]>>4)-8;
+                a += d*lo*xb[i]; a += d*hi*xb[i+16]; } }
+        out[row]=a; }
+}
+static void pq_q8_0_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*34; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*34; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const float *xb=x+(size_t)b*32;
+            for (int i=0;i<32;i++) a += d*(float)(int8_t)bl[2+i]*xb[i]; }
+        out[row]=a; }
+}
+static void pq_q5_0_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*22; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*22; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            uint32_t qh=(uint32_t)bl[2]|((uint32_t)bl[3]<<8)|((uint32_t)bl[4]<<16)|((uint32_t)bl[5]<<24);
+            const uint8_t *qs=bl+6; const float *xb=x+(size_t)b*32;
+            for (int j=0;j<16;j++) { int lo=qs[j]&0x0F, hi=qs[j]>>4; int h0=(qh>>j)&1, h1=(qh>>(j+16))&1;
+                a += d*(float)((lo|(h0<<4))-16)*xb[j]; a += d*(float)((hi|(h1<<4))-16)*xb[j+16]; } }
+        out[row]=a; }
+}
+static void pq_smk4(int j, const uint8_t *sc, uint8_t *s, uint8_t *m) {
+    if (j<4) { *s=sc[j]&63; *m=sc[j+4]&63; }
+    else { *s=(sc[j+4]&0x0F)|((sc[j-4]>>6)<<4); *m=(sc[j+4]>>4)|((sc[j]>>6)<<4); }
+}
+static void pq_q4_k_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/256;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*144; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*144;
+            float d=f16_to_f32(bl[0]|(bl[1]<<8)), dmin=f16_to_f32(bl[2]|(bl[3]<<8));
+            const uint8_t *sc=bl+4,*qs=bl+16; const float *xb=x+(size_t)b*256; int is=0,qi=0;
+            for (int j=0;j<256;j+=64) { uint8_t s0,m0,s1,m1; pq_smk4(is,sc,&s0,&m0); pq_smk4(is+1,sc,&s1,&m1);
+                float d1=d*s0,mm1=dmin*m0,d2=d*s1,mm2=dmin*m1;
+                for (int l=0;l<32;l++) a += (d1*(float)(qs[qi+l]&0x0F)-mm1)*xb[j+l];
+                for (int l=0;l<32;l++) a += (d2*(float)(qs[qi+l]>>4)-mm2)*xb[j+32+l];
+                qi+=32; is+=2; } }
+        out[row]=a; }
+}
+static void pq_q6_k_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/256;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*210; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*210, *ql=bl, *qh=bl+128;
+            const int8_t *sc=(const int8_t*)(bl+192); float d=f16_to_f32(bl[208]|(bl[209]<<8));
+            const float *xb=x+(size_t)b*256;
+            for (int n=0;n<256;n+=128) { const uint8_t *qlh=ql+(n/128)*64,*qhh=qh+(n/128)*32; const int8_t *sch=sc+(n/128)*8;
+                for (int l=0;l<32;l++) { int is=l/16;
+                    int q1=(int)((qlh[l]&0x0F)|(((qhh[l]>>0)&3)<<4))-32, q2=(int)((qlh[l+32]&0x0F)|(((qhh[l]>>2)&3)<<4))-32;
+                    int q3=(int)((qlh[l]>>4)|(((qhh[l]>>4)&3)<<4))-32, q4=(int)((qlh[l+32]>>4)|(((qhh[l]>>6)&3)<<4))-32;
+                    a += d*sch[is+0]*q1*xb[n+l]; a += d*sch[is+2]*q2*xb[n+l+32];
+                    a += d*sch[is+4]*q3*xb[n+l+64]; a += d*sch[is+6]*q4*xb[n+l+96]; } } }
+        out[row]=a; }
+}
+
+typedef void (*pq_fn)(float*, const uint8_t*, const float*, int, int, int);
+static pq_fn pq_for(int dt, int c) {
+    switch (dt) {
+        case 1:  return pq_f16_rows;
+        case 2:  return (c%32)?NULL:pq_q4_0_rows;
+        case 6:  return (c%32)?NULL:pq_q5_0_rows;
+        case 8:  return (c%32)?NULL:pq_q8_0_rows;
+        case 12: return (c%256)?NULL:pq_q4_k_rows;
+        case 14: return (c%256)?NULL:pq_q6_k_rows;
+    }
+    return NULL;
+}
+typedef struct { pq_fn fn; float *out; const uint8_t *Wq; const float *x; int r0,r1,c; } PQWork;
+static void *pq_worker(void *arg) { PQWork *w=(PQWork*)arg; w->fn(w->out,w->Wq,w->x,w->r0,w->r1,w->c); return NULL; }
+
+/* out[r] = Wq[r,c] @ x[c], weights packed. Returns 0 ok, -1 if dtype unsupported. */
+static int doe_qmatvec(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
+    pq_fn fn = pq_for(dt, c);
+    if (!fn) return -1;
+    int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
+    if (nt <= 1 || (long)r*c < (1L<<20)) { fn(out, Wq, x, 0, r, c); return 0; }
+    pthread_t thr[32]; PQWork work[32]; int chunk=(r+nt-1)/nt, actual=0;
+    for (int t=0;t<nt;t++) { int r0=t*chunk, r1=r0+chunk; if (r0>=r) break; if (r1>r) r1=r;
+        work[t]=(PQWork){fn,out,Wq,x,r0,r1,c}; pthread_create(&thr[t],NULL,pq_worker,&work[t]); actual++; }
+    for (int t=0;t<actual;t++) pthread_join(thr[t],NULL);
+    return 0;
+}
+
+/* int8 dynamic-activation-quant fast path (Q4_0), NEON SDOT / scalar. APPROXIMATE. */
+static void pq_quant_act_q8(const float *x, int c, int8_t *qa, float *da) {
+    int nb=c/32;
+    for (int b=0;b<nb;b++) { const float *xb=x+(size_t)b*32; float amax=0;
+        for (int i=0;i<32;i++){ float v=fabsf(xb[i]); if(v>amax)amax=v; }
+        float d=amax/127.0f, id=(d>0)?1.0f/d:0.0f; da[b]=d;
+        for (int i=0;i<32;i++){ int q=(int)lrintf(xb[i]*id); if(q>127)q=127; else if(q<-127)q=-127; qa[(size_t)b*32+i]=(int8_t)q; } }
+}
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#include <arm_neon.h>
+static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+    int nb=c/32; const uint8x16_t m0f=vdupq_n_u8(0x0F); const int8x16_t e8=vdupq_n_s8(8);
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const int8_t *qab=qa+(size_t)b*32; uint8x16_t pk=vld1q_u8(bl+2);
+            int8x16_t lo=vsubq_s8(vreinterpretq_s8_u8(vandq_u8(pk,m0f)),e8), hi=vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),e8);
+            int32x4_t s=vdupq_n_s32(0); s=vdotq_s32(s,lo,vld1q_s8(qab)); s=vdotq_s32(s,hi,vld1q_s8(qab+16));
+            a += d*da[b]*(float)vaddvq_s32(s); }
+        out[row]=a; }
+}
+#else
+static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const int8_t *qab=qa+(size_t)b*32; int32_t s=0;
+            for (int i=0;i<16;i++){ int lo=(int)(bl[2+i]&0x0F)-8, hi=(int)(bl[2+i]>>4)-8; s+=lo*qab[i]; s+=hi*qab[i+16]; }
+            a += d*da[b]*(float)s; }
+        out[row]=a; }
+}
+#endif
+static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
+    if (dt != 2 || (c%32)) return -1;
+    int nb=c/32; int8_t *qa=(int8_t*)malloc((size_t)c); float *da=(float*)malloc((size_t)nb*sizeof(float));
+    if (!qa || !da) { free(qa); free(da); return -1; }
+    pq_quant_act_q8(x, c, qa, da);
+    pq_q4_0_rows_i8(out, Wq, qa, da, 0, r, c);
+    free(qa); free(da); return 0;
+}
+
+/* matvec dispatch: packed weight (dt != 0) -> doe_qmatvec (inline dequant);
+ * else the existing f32 matvec. The one call the forward uses for host weights.
+ * DOE_INT8=1 opts the Q4_0 weights into the int8 dynamic-activation-quant fast path
+ * (doe_qmatvec_i8, NEON SDOT) — APPROXIMATE; default is the exact dequant-inline path. */
+static int g_doe_int8 = -1;
+static double g_prof_mv_ns = 0; static int g_prof_on = -1; /* DOE_PROFILE: matvec share of decode */
+static double g_resident_ns = 0, g_head_ns = 0;  /* DOE_PROFILE: resident CB vs lm_head split */
+/* DOE_PERSHAPE: per-group matvec timing (Mythos M3 geometry input). Groups keyed
+ * by (m,k) against model dims set at forward start. Sync path only (DOE_NO_SLOTS+
+ * DOE_NO_BATCH) so each matvec is timed individually. */
+enum { MVG_QKV = 0, MVG_O, MVG_FFNGU, MVG_FFNDN, MVG_LMHEAD, MVG_N, MVG_OTHER = -1 };
+static int g_ps_on = -1;
+static double g_ps_ns[MVG_N];
+static long   g_ps_cnt[MVG_N];
+static int    g_ps_m[MVG_N], g_ps_k[MVG_N], g_ps_dt[MVG_N];
+static int    g_ps_D, g_ps_qn, g_ps_kd, g_ps_H, g_ps_H2, g_ps_vocab; /* dims for keying */
+static int pershape_group(int m, int k) {
+    if (k == g_ps_D) {
+        if (m == g_ps_qn || m == g_ps_kd) return MVG_QKV;
+        if (m == g_ps_H2 || m == g_ps_H)  return MVG_FFNGU;
+        if (m == g_ps_vocab)              return MVG_LMHEAD;
+    }
+    if (k == g_ps_qn && m == g_ps_D) return MVG_O;
+    if (k == g_ps_H  && m == g_ps_D) return MVG_FFNDN;
+    return MVG_OTHER;
+}
+static void doe_mv_impl(float *out, const float *W, int dt, const float *x, int r, int c) {
+    if (dt) {
+#ifdef USE_METAL
+        /* Metal: Q4_K (dt=12) + Q6_K (dt=14, lm_head) through GPU kernels (resident weights); CPU fallback on rc!=0 */
+        if (dt == 12 && nt_metal_available() && nt_metal_q4k_matvec(out, (const uint8_t*)W, x, r, c) == 0) return;
+        if (dt == 14 && nt_metal_available() && nt_metal_q6k_matvec(out, (const uint8_t*)W, x, r, c) == 0) {
+            if (getenv("DOE_VERIFY_Q6K")) {  /* real-path bit-identical check vs CPU dequant on live weights */
+                float *vt = (float*)malloc((size_t)r * 4);
+                if (vt) {
+                    pq_q6_k_rows(vt, (const uint8_t*)W, x, 0, r, c);
+                    float mx = 0; int bad = 0;
+                    for (int z = 0; z < r; z++) { float dn = fabsf(vt[z]) > 1.0f ? fabsf(vt[z]) : 1.0f;
+                        float rl = fabsf(out[z] - vt[z]) / dn; if (rl > mx) { mx = rl; bad = z; } }
+                    fprintf(stderr, "[verify-q6k] m=%d k=%d max_rel=%.2e row %d: cpu=%.4f metal=%.4f\n",
+                            r, c, mx, bad, vt[bad], out[bad]);
+                    free(vt);
+                }
+            }
+            return;
+        }
+#endif
+        if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='1') ? 1 : 0; }
+        if (g_doe_int8 && doe_qmatvec_i8(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+        if (doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+        /* D-M6: packed dtype but qmatvec failed — never fall through to matvec(),
+         * which would reinterpret the packed bytes as f32 (the generalized sonar
+         * bug). Loud abort instead of silent garbage / segfault. */
+        fprintf(stderr, "[doe] FATAL: doe_qmatvec failed for packed dtype %d (r=%d c=%d); refusing to read packed bytes as f32\n", dt, r, c);
+        abort();
+    }
+    matvec(out, W, x, r, c);
+}
+/* DOE_PROFILE wrapper: time the matvec share of decode (Metal Q4_K + CPU rest). Off = zero overhead. */
+static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
+    if (g_prof_on < 0) { const char *e = getenv("DOE_PROFILE");  g_prof_on = (e && e[0]) ? 1 : 0; }
+    if (g_ps_on   < 0) { const char *e = getenv("DOE_PERSHAPE"); g_ps_on   = (e && e[0]) ? 1 : 0; }
+    if (!g_prof_on && !g_ps_on) { doe_mv_impl(out, W, dt, x, r, c); return; }
+    struct timespec _p0, _p1; clock_gettime(CLOCK_MONOTONIC, &_p0);
+    doe_mv_impl(out, W, dt, x, r, c);
+    clock_gettime(CLOCK_MONOTONIC, &_p1);
+    double _ns = (_p1.tv_sec - _p0.tv_sec) * 1e9 + (_p1.tv_nsec - _p0.tv_nsec);
+    if (g_prof_on) g_prof_mv_ns += _ns;
+    if (g_ps_on) {
+        int g = pershape_group(r, c);
+        if (g >= 0) { g_ps_ns[g] += _ns; g_ps_cnt[g]++; g_ps_m[g] = r; g_ps_k[g] = c; g_ps_dt[g] = dt; }
+    }
+}
+
 static void softmax_n(float *x, int n) {
     float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
     float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-mx); s += x[i]; }
     for (int i = 0; i < n; i++) x[i] /= s;
 }
 
-static void apply_rope(float *v, int pos, float *cc, float *sc, int hd) {
+static void apply_rope_mode(float *v, int pos, float *cc, float *sc, int hd, int norm_pairs) {
     int h = hd/2, off = pos*h; /* hd must be even — all standard archs are */
-    for (int i = 0; i < h; i++) {
-        float x0 = v[i], x1 = v[i+h];
-        v[i] = x0*cc[off+i] - x1*sc[off+i];
-        v[i+h] = x0*sc[off+i] + x1*cc[off+i];
+    if (norm_pairs) {
+        for (int i = 0; i < h; i++) {
+            int j = 2*i;
+            float x0 = v[j], x1 = v[j+1];
+            v[j]   = x0*cc[off+i] - x1*sc[off+i];
+            v[j+1] = x0*sc[off+i] + x1*cc[off+i];
+        }
+    } else {
+        for (int i = 0; i < h; i++) {
+            float x0 = v[i], x1 = v[i+h];
+            v[i] = x0*cc[off+i] - x1*sc[off+i];
+            v[i+h] = x0*sc[off+i] + x1*cc[off+i];
+        }
     }
+}
+
+/* RoPE pairing per architecture, mirroring llama.cpp llama_model_rope_type()
+ * (src/llama-model.cpp): llama-family + Mistral use NORM (adjacent pairs 2i,2i+1);
+ * the qwen/falcon/gemma/phi/... family uses NEOX (offset-half pairs i,i+hd/2).
+ * GGUF permutes Q/K for whichever the arch expects, so the wrong mode is identity
+ * at pos 0 but corrupts rope progressively at pos>0 (coherent short, broken long). */
+static int arch_rope_norm(const char *arch) {
+    return strcmp(arch, "llama") == 0 || strcmp(arch, "mistral") == 0 ||
+           strcmp(arch, "mistral3") == 0 || strcmp(arch, "mistral4") == 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1174,6 +1442,18 @@ typedef struct {
     float complexity;         /* model complexity metric */
     uint64_t fingerprint;     /* hash of weight statistics — identifies this host */
 } WeightProfile;
+
+/* Dequantize a packed tensor to f32 (dispatch by GGUF dtype). Used by the sonar
+ * to profile weights that index_load now keeps packed (else it reads packed bytes
+ * as f32 — harmless overread on f16, a hard segfault on the smaller quants). */
+static void doe_dequant_to_f32(const uint8_t *src, int dt, uint64_t n, float *out) {
+    if (dt == 1) { const uint16_t *h = (const uint16_t*)src; for (uint64_t j = 0; j < n; j++) out[j] = f16_to_f32(h[j]); }
+    else if (dt == 2)  dequant_q4_0(src, out, n);
+    else if (dt == 6)  dequant_q5_0(src, out, n);
+    else if (dt == 8)  dequant_q8_0(src, out, n);
+    else if (dt == 12) dequant_q4_k(src, out, n);
+    else if (dt == 14) dequant_q6_k(src, out, n);
+}
 
 static void profile_weights(float *data, int rows, int cols, LayerProfile *out) {
     int n = rows * cols;
@@ -1286,6 +1566,7 @@ typedef struct {
     float *host_tok_emb;
     float *host_output;
     float *host_norm;
+    int   host_output_dt;    /* packed GGUF dtype of host_output (0 = f32 / tied) */
     float    rope_theta;     /* RoPE frequency base (default 10000, Qwen=1000000) */
     float    rms_norm_eps;   /* RMSNorm epsilon (default 1e-5, varies per arch) */
     struct {
@@ -1294,11 +1575,23 @@ typedef struct {
         float *ffn_gate, *ffn_up, *ffn_down;
         float *ffn_gate_up;  /* fused gate+up for Phi-3 (size: hidden*2 × dim) */
         float *attn_norm, *ffn_norm;
+        /* packed GGUF dtype per matvec weight (0 = f32-dequant'd; else kept packed) */
+        int wq_dt, wk_dt, wv_dt, wo_dt, ffn_gate_dt, ffn_up_dt, ffn_down_dt, ffn_gate_up_dt;
     } host_layers[MAX_LAYERS];
 
     /* DOE's living overlay */
     FieldLayer field_layers[MAX_LAYERS];
     int n_field_layers;
+
+    /* Parliament-on-GPU: contiguous page-aligned arena of the (frozen at
+     * inference) expert weights + vote rows, registered for slot kernels.
+     * Per layer: [w_vote 16*D | per-expert (B rank*D, A D*rank) x16].
+     * Built once after field init when Metal is available and alpha != 0. */
+    float  *expert_arena;
+    size_t  expert_arena_floats;
+    size_t  expert_layer_floats;   /* stride per layer, in floats */
+    int     expert_arena_ready;
+    int     cons_slot_init;        /* SLOT_PCONS seeded from parliament.consensus once */
 
     /* Host profiling */
     WeightProfile profile;
@@ -1321,6 +1614,7 @@ typedef struct {
     int     bos_id, eos_id; /* special tokens */
     int     add_space_prefix;
     int     is_gpt2_bpe;    /* 1 if tokenizer.ggml.model == "gpt2" */
+    int     is_tekken;      /* 1 if tokenizer.ggml.pre == "tekken" */
 
     /* GPT-2 BPE merges (used to build scores if no native scores) */
     char  **bpe_merges;     /* merge strings "A B" */
@@ -1466,6 +1760,57 @@ static void free_lora_expert(LoraExpert *e) {
     e->alive = 0; e->vitality = 0;
 }
 
+#ifdef USE_METAL
+/* Parliament-on-GPU step 1 — pack the (inference-frozen) per-layer vote rows +
+ * expert LoRA matrices into one contiguous, page-aligned arena and register it
+ * as a zero-copy GPU region. The election/inject kernels then bind w_vote / A /
+ * B by offset (resolve_region) instead of uploading per token. Built once at
+ * load, only when Metal is live and the parliament is active (alpha != 0). The
+ * experts are static at --train 0 (births/deaths gated on g_train, :3511), so
+ * one pack suffices — no re-sync. Dead expert slots stay zero (memset arena) so
+ * a gate weight of 0 over them is a true no-op.
+ *   Per layer: [ w_vote MAX_EXPERTS*D | per-expert (B rank*D, A D*rank) x MAX_EXPERTS ]. */
+static void field_repack_arena(GGUFIndex *ps) {
+    if (ps->expert_arena_ready) return;
+    int D = ps->host_dim, rank = ps->lora_rank, L = ps->n_field_layers;
+    size_t per_expert  = (size_t)rank * D + (size_t)D * rank;            /* B then A */
+    size_t layer_floats = (size_t)MAX_EXPERTS * D + (size_t)MAX_EXPERTS * per_expert;
+    size_t total_floats = layer_floats * (size_t)L;
+    size_t pg    = (size_t)getpagesize();
+    size_t bytes = (total_floats * sizeof(float) + pg - 1) / pg * pg;    /* register needs page-aligned len */
+    float *arena = NULL;
+    if (posix_memalign((void**)&arena, pg, bytes) != 0 || !arena) {
+        fprintf(stderr, "[doe] parliament arena posix_memalign(%zu) failed — parliament stays on CPU\n", bytes);
+        return;
+    }
+    memset(arena, 0, bytes);                                            /* dead experts -> zero contribution */
+    for (int l = 0; l < L; l++) {
+        FieldLayer *fl = &ps->field_layers[l];
+        float *base = arena + (size_t)l * layer_floats;
+        memcpy(base, fl->parliament.w_vote, (size_t)MAX_EXPERTS * D * sizeof(float));
+        float *ep = base + (size_t)MAX_EXPERTS * D;
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            if (!fl->experts[e].alive) continue;                        /* leave zero */
+            float *eb = ep + (size_t)e * per_expert;
+            memcpy(eb,                    fl->experts[e].lora_B, (size_t)rank * D * sizeof(float)); /* B [rank,D] */
+            memcpy(eb + (size_t)rank * D, fl->experts[e].lora_A, (size_t)D * rank * sizeof(float)); /* A [D,rank] */
+        }
+    }
+    if (nt_metal_register_region(arena, bytes) != 0) {
+        fprintf(stderr, "[doe] parliament arena register_region failed — parliament stays on CPU\n");
+        free(arena);
+        return;
+    }
+    ps->expert_arena        = arena;
+    ps->expert_arena_floats = total_floats;
+    ps->expert_layer_floats = layer_floats;
+    ps->expert_arena_ready  = 1;
+    fprintf(stderr, "[doe] parliament arena: %.1f MB registered (%d layers x %zu f/layer; arena[0]=%.6f src=%.6f)\n",
+            (double)bytes / (1024.0*1024.0), L, layer_floats,
+            arena[0], ps->field_layers[0].parliament.w_vote[0]);
+}
+#endif
+
 static int tok_lookup(GGUFIndex *ps, const char *s, int len);
 static void tok_ht_build(GGUFIndex *ps);
 static void build_gpt2_scores(GGUFIndex *ps);
@@ -1487,6 +1832,11 @@ static int index_load(GGUFIndex *ps, const char *path) {
     ps->mmap_base = mmap(NULL, ps->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (ps->mmap_base == MAP_FAILED) { ps->mmap_base = NULL; return 0; }
+#ifdef USE_METAL
+    /* Metal: register the whole packed GGUF block as a resident zero-copy GPU buffer (Phase 2 —
+     * weights bind by offset, no per-token upload). mmap base is page-aligned. */
+    if (nt_metal_available()) nt_metal_register_base(ps->mmap_base, ps->mmap_size);
+#endif
 
     /* Parse GGUF header */
     uint8_t *p = ps->mmap_base, *pend = ps->mmap_base + ps->mmap_size;
@@ -1499,17 +1849,29 @@ static int index_load(GGUFIndex *ps, const char *path) {
 
     for (uint64_t i = 0; i < n_kv; i++) {
         PC(8); uint64_t klen = *(uint64_t*)p; p += 8;
-        if (klen > 255) { p += klen + 4; continue; } /* skip long keys */
-        char key[256]; memcpy(key, p, klen); key[klen] = '\0'; p += klen;
+        char key[256];
+        if (klen > 255) {
+            /* D-M1: an oversized key still has a vtype + value after it — skip
+             * only the key bytes and let the vtype handling below parse/skip the
+             * value, or the parser desyncs. Empty key matches no strstr. */
+            PC(klen); p += klen; key[0] = '\0';
+        } else {
+            PC(klen); memcpy(key, p, klen); key[klen] = '\0'; p += klen; /* D-M2: bound key payload */
+        }
         PC(4); uint32_t vtype = *(uint32_t*)p; p += 4;
         if (vtype == 8) { /* string */
             PC(8); uint64_t vlen = *(uint64_t*)p; p += 8;
+            PC(vlen); /* D-M2: bound the string payload before any memcpy reads it */
             if (strstr(key, "general.architecture") && vlen < 64) {
                 memcpy(ps->host_arch, p, vlen); ps->host_arch[vlen] = 0;
             }
             if (strstr(key, "tokenizer.ggml.model") && vlen < 20) {
                 char tok_model[24]; memcpy(tok_model, p, vlen); tok_model[vlen] = 0;
                 if (strcmp(tok_model, "gpt2") == 0) ps->is_gpt2_bpe = 1;
+            }
+            if (strstr(key, "tokenizer.ggml.pre") && vlen < 64) {
+                char tok_pre[64]; memcpy(tok_pre, p, vlen); tok_pre[vlen] = 0;
+                if (strcmp(tok_pre, "tekken") == 0) ps->is_tekken = 1;
             }
             /* DOE identity fingerprint — this GGUF is DOE's own */
             if (strcmp(key, "doe.identity") == 0 && vlen < 128) {
@@ -1539,6 +1901,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
             else if (strstr(key, "bos_token_id")) ps->bos_id = (int)val;
             else if (strstr(key, "eos_token_id")) ps->eos_id = (int)val;
             else if (strstr(key, "add_space_prefix")) ps->add_space_prefix = (int)val;
+            else if (strstr(key, "attention.key_length")) ps->host_head_dim = (int)val;
         } else if (vtype == 6) { /* float32 */
             PC(4); float fval; memcpy(&fval, p, 4); p += 4;
             if (strstr(key, "rope.freq_base")) ps->rope_theta = fval;
@@ -1560,6 +1923,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 elem_sz = 4;
                 /* float32 array: tokenizer.ggml.scores */
                 if (atype == 6 && strstr(key, "tokenizer.ggml.scores") && alen < 200000) {
+                    PC(alen * 4); /* D-M2: bound the scores payload (else up to ~800KB OOB read) */
                     ps->vocab_scores = malloc(alen * sizeof(float));
                     memcpy(ps->vocab_scores, p, alen * 4);
                 }
@@ -1569,7 +1933,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 /* array of strings */
                 int is_vocab = strstr(key, "tokenizer.ggml.tokens") != NULL;
                 int is_merges = strstr(key, "tokenizer.ggml.merges") != NULL;
-                if (is_vocab && alen < 200000) {
+                if (is_vocab && alen < 1000000) {
                     ps->vocab_tokens = calloc(alen, sizeof(char*));
                     ps->vocab_size = (int)alen;
                 }
@@ -1594,13 +1958,14 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 }
                 continue;
             }
+            PC(alen * elem_sz); /* D-M2: bound the array payload before skipping past it */
             p += alen * elem_sz;
         } else { p += 4; } /* unknown — guess 4 bytes */
     }
-    if (ps->host_dim == 0 || ps->host_n_layers == 0) goto bail;
+    if (ps->host_dim == 0 || ps->host_dim > 16384 || ps->host_n_layers == 0) goto bail; /* D-L8: bound host_dim — lora_out[D] is a stack VLA */
     if (ps->host_heads == 0) ps->host_heads = ps->host_dim / 64;
     if (ps->host_kv_heads == 0) ps->host_kv_heads = ps->host_heads;
-    ps->host_head_dim = ps->host_dim / ps->host_heads;
+    if (ps->host_head_dim == 0) ps->host_head_dim = ps->host_dim / ps->host_heads; /* Y-1b: prefer attention.key_length (Mistral hd=128 ≠ 5120/32=160) */
     if (ps->host_hidden == 0) ps->host_hidden = ps->host_dim * 4;
 
     /* Parse tensor info */
@@ -1640,10 +2005,19 @@ static int index_load(GGUFIndex *ps, const char *path) {
                        (unsigned long)ps->mmap_size);
             continue;
         }
-        float *data;
+        float *data; int data_dt = 0;
         const uint8_t *src = ps->mmap_base + byte_offset;
+        char *n = tinfo[i].name;
+        /* matvec weights stay PACKED (dequantized inline by doe_qmatvec, no f32
+         * blow-up); embeddings / norms / biases dequant to f32 as before. */
+        int is_mv_w = strstr(n,"attn_q.weight")||strstr(n,"attn_k.weight")||strstr(n,"attn_v.weight")||
+                      strstr(n,"attn_output.weight")||strstr(n,"ffn_gate.weight")||strstr(n,"ffn_up.weight")||
+                      strstr(n,"ffn_down.weight")||strstr(n,"ffn_gate_up")||strcmp(n,"output.weight")==0;
         if (dt == 0) {
             data = (float*)src; /* f32: point directly into mmap */
+        } else if (is_mv_w && pq_for(dt, (int)tinfo[i].dims[0])) {
+            data = (float*)src; /* keep packed — matvec dequants inline */
+            data_dt = dt;
         } else {
             /* dequantize to f32 */
             data = malloc(n_elems * sizeof(float));
@@ -1658,7 +2032,6 @@ static int index_load(GGUFIndex *ps, const char *path) {
             ps->f16_bufs = realloc(ps->f16_bufs, (ps->n_f16_bufs+1)*sizeof(float*));
             ps->f16_bufs[ps->n_f16_bufs++] = data;
         }
-        char *n = tinfo[i].name;
         /* debug: if (i < 15) printf("[tensor] %s dims=[%lu,%lu]\n", n, (unsigned long)tinfo[i].dims[0], (unsigned long)tinfo[i].dims[1]); */
         if (strcmp(n, "token_embd.weight") == 0) {
             ps->host_tok_emb = data;
@@ -1666,29 +2039,29 @@ static int index_load(GGUFIndex *ps, const char *path) {
             wired++;
         }
         else if (strcmp(n, "output_norm.weight") == 0) { ps->host_norm = data; wired++; }
-        else if (strcmp(n, "output.weight") == 0) { ps->host_output = data; wired++; }
+        else if (strcmp(n, "output.weight") == 0) { ps->host_output = data; ps->host_output_dt = data_dt; wired++; }
         else {
             int l = -1; sscanf(n, "blk.%d.", &l);
             if (l >= 0 && l < MAX_LAYERS && l < ps->host_n_layers) {
-                if (strstr(n, "attn_q.weight")) { ps->host_layers[l].wq = data; wired++; }
-                else if (strstr(n, "attn_k.weight")) { ps->host_layers[l].wk = data; wired++; }
-                else if (strstr(n, "attn_v.weight")) { ps->host_layers[l].wv = data; wired++; }
-                else if (strstr(n, "attn_output.weight")) { ps->host_layers[l].wo = data; wired++; }
+                if (strstr(n, "attn_q.weight")) { ps->host_layers[l].wq = data; ps->host_layers[l].wq_dt = data_dt; wired++; }
+                else if (strstr(n, "attn_k.weight")) { ps->host_layers[l].wk = data; ps->host_layers[l].wk_dt = data_dt; wired++; }
+                else if (strstr(n, "attn_v.weight")) { ps->host_layers[l].wv = data; ps->host_layers[l].wv_dt = data_dt; wired++; }
+                else if (strstr(n, "attn_output.weight")) { ps->host_layers[l].wo = data; ps->host_layers[l].wo_dt = data_dt; wired++; }
                 else if (strstr(n, "attn_q.bias")) { ps->host_layers[l].bq = data; wired++; }
                 else if (strstr(n, "attn_k.bias")) { ps->host_layers[l].bk = data; wired++; }
                 else if (strstr(n, "attn_v.bias")) { ps->host_layers[l].bv = data; wired++; }
-                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp") && !strstr(n, "ffn_gate_up")) { ps->host_layers[l].ffn_gate = data; wired++; }
+                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp") && !strstr(n, "ffn_gate_up")) { ps->host_layers[l].ffn_gate = data; ps->host_layers[l].ffn_gate_dt = data_dt; wired++; }
                 else if (strstr(n, "ffn_up.weight") && !strstr(n, "gate_up")) {
                     /* Check if fused gate+up: dims[1] > host_hidden means [dim, hidden*2] */
                     if (ps->host_hidden > 0 && (int)tinfo[i].dims[1] > ps->host_hidden * 3 / 2) {
-                        ps->host_layers[l].ffn_gate_up = data;
+                        ps->host_layers[l].ffn_gate_up = data; ps->host_layers[l].ffn_gate_up_dt = data_dt;
                     } else {
-                        ps->host_layers[l].ffn_up = data;
+                        ps->host_layers[l].ffn_up = data; ps->host_layers[l].ffn_up_dt = data_dt;
                     }
                     wired++;
                 }
-                else if (strstr(n, "ffn_down.weight")) { ps->host_layers[l].ffn_down = data; wired++; }
-                else if (strstr(n, "ffn_gate_up_proj") || strstr(n, "ffn_gate_up.weight")) { ps->host_layers[l].ffn_gate_up = data; wired++; }
+                else if (strstr(n, "ffn_down.weight")) { ps->host_layers[l].ffn_down = data; ps->host_layers[l].ffn_down_dt = data_dt; wired++; }
+                else if (strstr(n, "ffn_gate_up_proj") || strstr(n, "ffn_gate_up.weight")) { ps->host_layers[l].ffn_gate_up = data; ps->host_layers[l].ffn_gate_up_dt = data_dt; wired++; }
                 else if (strstr(n, "attn_norm.weight")) { ps->host_layers[l].attn_norm = data; wired++; }
                 else if (strstr(n, "ffn_norm.weight")) { ps->host_layers[l].ffn_norm = data; wired++; }
                 else if (l == 0 && strstr(n, "ffn")) { printf("[doe] unwired FFN tensor: %s\n", n); }
@@ -1719,14 +2092,43 @@ static int index_load(GGUFIndex *ps, const char *path) {
         goto bail;
     }
 
+    /* D-M5: the forward guards only wq; a layer with wq wired but any attention
+     * matvec weight (wk/wv/wo) NULL — skipped because it was in an unsupported
+     * quant — would reach doe_mv with a NULL pointer and segfault. DoE scans
+     * directories for foreign GGUFs, so mixed-quant bodies are realistic. Drop
+     * incomplete layers loudly so the forward's `if (!wq) continue` skips them. */
+    for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+        if (!ps->host_layers[l].wq) continue;
+        int ffn_ok = (ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down) ||
+                     (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down);
+        if (!ps->host_layers[l].wk || !ps->host_layers[l].wv ||
+            !ps->host_layers[l].wo || !ffn_ok) {
+            printf("[doe] WARNING: host layer %d incomplete (a weight is in an unsupported quant); dropping the layer\n", l);
+            ps->host_layers[l].wq = NULL;
+        }
+    }
+
     /* ── Weight profiling — the sonar ── */
     printf("[sonar] profiling host weights...\n");
     ps->profile.n_layers = ps->host_n_layers;
     for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
-        if (ps->host_layers[l].ffn_gate)
-            profile_weights(ps->host_layers[l].ffn_gate, ps->host_hidden, ps->host_dim, &ps->profile.layers[l]);
-        else
+        if (ps->host_layers[l].ffn_gate) {
+            int gdt = ps->host_layers[l].ffn_gate_dt;
+            if (gdt) {
+                /* weight kept packed — dequant a temp f32 copy just for profiling */
+                uint64_t ne = (uint64_t)ps->host_hidden * ps->host_dim;
+                float *tmp = malloc(ne * sizeof(float));
+                if (tmp) {
+                    doe_dequant_to_f32((const uint8_t*)ps->host_layers[l].ffn_gate, gdt, ne, tmp);
+                    profile_weights(tmp, ps->host_hidden, ps->host_dim, &ps->profile.layers[l]);
+                    free(tmp);
+                } else memset(&ps->profile.layers[l], 0, sizeof(LayerProfile));
+            } else {
+                profile_weights(ps->host_layers[l].ffn_gate, ps->host_hidden, ps->host_dim, &ps->profile.layers[l]);
+            }
+        } else {
             memset(&ps->profile.layers[l], 0, sizeof(LayerProfile));
+        }
     }
     float total_h = 0;
     for (int l = 0; l < ps->profile.n_layers; l++) total_h += ps->profile.layers[l].health;
@@ -1777,18 +2179,24 @@ static int index_load(GGUFIndex *ps, const char *path) {
         }
     }
 
+    /* NB: the parliament-on-GPU arena is packed AFTER mycelium_load (in main),
+     * not here — a spore mutates w_vote/A/B, so packing must see the final
+     * expert state. See field_repack_arena call after mycelium_load. */
+
     ps->active = 1;
     /* Build token hash table for O(1) lookup, then GPT-2 BPE scores */
     tok_ht_build(ps);
     build_gpt2_scores(ps);
-    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d kv=%d vocab=%d %.1fMB)\n",
+    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d kv=%d hd=%d vocab=%d %.1fMB)\n",
            path, ps->host_arch, ps->host_dim, ps->host_n_layers, ps->host_heads,
-           ps->host_kv_heads, ps->host_vocab, (float)ps->mmap_size/(1024*1024));
+           ps->host_kv_heads, ps->host_head_dim, ps->host_vocab, (float)ps->mmap_size/(1024*1024));
     printf("[doe] rope_theta=%.0f rms_eps=%.1e bias=%s\n",
            ps->rope_theta, ps->rms_norm_eps,
            ps->host_layers[0].bq ? "yes" : "no");
-    if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE (%d merges)\n", ps->n_bpe_merges);
+    if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE%s (%d merges)\n", ps->is_tekken ? "/Tekken" : "", ps->n_bpe_merges);
     /* Auto-detect nanollama chat style from identity tag or vocab tokens */
+    if (ps->chat_style == 0 && ps->is_tekken && tok_lookup(ps, "[INST]", 6) >= 0)
+        ps->chat_style = 2;
     if (ps->chat_style == 0 && (ps->identity_tag[0] ||
         tok_lookup(ps, "<|user_start|>", 14) >= 0)) ps->chat_style = 6;
     { const char *cs[] = {"raw","chatml","inst","zephyr","phi","gemma","nanollama"};
@@ -1824,6 +2232,14 @@ static void index_free(GGUFIndex *ps) {
         free(ps->bpe_merges);
     }
     if (ps->mmap_base) munmap(ps->mmap_base, ps->mmap_size);
+#ifdef USE_METAL
+    /* expert_arena is wrapped by a NoCopy MTLBuffer (deallocator:nil) in notorch's
+     * segment table and there is no per-region unregister. index_free runs once at
+     * process exit (single-model lifecycle, :4171/:4221), so we deliberately do not
+     * free the arena here — the OS reclaims it at exit, and the registered buffer is
+     * guaranteed to outlive any GPU use. Freeing under the live NoCopy view would
+     * leave a dangling segment. */
+#endif
     memset(ps, 0, sizeof(GGUFIndex));
 }
 
@@ -1886,6 +2302,11 @@ static int notorch_offset = 0; /* rotating window into LoRA rank */
 static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
                          const float *x, const float *dy, float signal) {
     if (fabsf(signal) < 1e-8f) return;
+    /* D-M2/Mythos: learn_signal (:3084) is asymmetric — punishment scales as -pd
+     * (unbounded), reward is capped at 0.1. Clamp it so one high-debt step can't
+     * overwrite the channel ~10x. Canon parity (am_notorch_step :7270). */
+    if (signal >  2.0f) signal =  2.0f;
+    if (signal < -2.0f) signal = -2.0f;
     float lr = F.notorch_lr * signal;
     /* NOTORCH operates at rank 4 but rotates across all LORA_RANK components.
      * each call updates 4 components starting at notorch_offset.
@@ -1897,28 +2318,107 @@ static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
     for (int j = 0; j < nr; j++) {
         int r = (base + j) % rank;
         float s = 0;
-        for (int i = 0; i < out_dim && i < in_dim; i++) s += B[i * rank + r] * dy[i];
+        for (int i = 0; i < out_dim && i < in_dim; i++) s += B[r * in_dim + i] * dy[i];
         u[j] = s + rand_normal() * 0.01f;
     }
-#ifdef USE_BLAS
+    /* Oja's rule on both A and B: grow toward the co-activation (x, dy) through
+     * the learned channel u, with the self-projection subtracted so each rank row
+     * self-normalizes. The channel neither fades (the old bare *= decay) nor blows
+     * up (canon's bare grow). This is what makes the parliament learn in-session
+     * instead of eroding from init noise. */
     for (int j = 0; j < nr; j++) {
         int r = (base + j) % rank;
-        cblas_saxpy(in_dim, lr * u[j], x, 1, A + r, rank);
-    }
-#else
-    for (int i = 0; i < in_dim; i++)
-        for (int j = 0; j < nr; j++) {
-            int r = (base + j) % rank;
-            A[i * rank + r] += lr * x[i] * u[j];
+        float ur = u[j];
+        for (int i = 0; i < in_dim; i++) {                 /* A = [in_dim, rank] */
+            float *a = &A[i * rank + r];
+            *a += lr * ur * (x[i] - ur * (*a));
         }
-#endif
-    /* decay only the components we touched */
-    float decay = F.notorch_decay;
-    for (int j = 0; j < nr; j++) {
-        int r = (base + j) % rank;
-        for (int i = 0; i < out_dim; i++) B[i * rank + r] *= decay;
+        for (int i = 0; i < out_dim && i < in_dim; i++) {  /* B = [rank, in_dim], apply layout */
+            float *b = &B[r * in_dim + i];
+            *b += lr * ur * (dy[i] - ur * (*b));
+        }
     }
     notorch_offset = (base + nr) % rank;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * BETWEEN-TURNS LEARNING — the parliament speaks first, reflects after
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Mythos+Oleg (2026-06-12 decision, 2026-06-20 built): notorch_step must NOT fire
+ * per-token mid-generation. Re-sewing an expert on the very token it is generating
+ * is a feedback loop — on a small host it collapses into token-salad within ~10
+ * tokens ("I do remember the don donI somethingcom ins .comned ...", measured on the
+ * 88M nano with --train 1). So during a turn we only ACCUMULATE the co-activation
+ * (x, dy) and the debt-driven signal; the experts learn ONCE, between turns, from the
+ * turn's MEAN — a single full Oja pass per expert instead of ~200 interleaved with
+ * the breath. The field still learns in-session (the mycelium spore carries it
+ * forward), but the parliament no longer eats its own words mid-sentence. --train
+ * gated exactly as before; --train 0 stays the static-expert default. θ persists. */
+typedef struct {
+    float   *x;        /* running sum of the host hidden-in over the turn (host_dim) */
+    float   *dy;       /* running sum of the host hidden-out over the turn (host_dim) */
+    float    signal;   /* running sum of the debt-driven learn_signal */
+    int      n;        /* tokens accumulated this turn */
+    int      dim;
+    uint8_t *seen;     /* [n_layers*MAX_EXPERTS]: experts active at ANY token this turn.
+                        * Captured here because update_expert_vitality clears tokens_seen
+                        * every 10 tokens, so the live flag is stale by flush time — the
+                        * delayed step must gate on who actually spoke, not the window. */
+    int      n_layers;
+} NotorchTurnAccum;
+
+static void nt_accum_init(NotorchTurnAccum *a, int dim, int n_layers) {
+    a->dim = dim; a->n = 0; a->signal = 0.0f; a->n_layers = n_layers;
+    a->x    = calloc(dim, sizeof(float));
+    a->dy   = calloc(dim, sizeof(float));
+    a->seen = calloc((size_t)n_layers * MAX_EXPERTS, 1);
+}
+
+static void nt_accum_free(NotorchTurnAccum *a) {
+    free(a->x); free(a->dy); free(a->seen); a->x = a->dy = NULL; a->seen = NULL;
+}
+
+/* fold one token's co-activation into the turn's running sums + mark which experts
+ * were active this token — no weights touched, generation stays on the experts the
+ * turn started with. */
+static void nt_accum_add(NotorchTurnAccum *a, GGUFIndex *ps, const float *x, const float *dy, float signal) {
+    if (!a->x || !a->dy) return; /* alloc failed → the turn just doesn't learn */
+    for (int i = 0; i < a->dim; i++) { a->x[i] += x[i]; a->dy[i] += dy[i]; }
+    a->signal += signal; a->n++;
+    if (a->seen)
+        for (int l = 0; l < ps->n_field_layers; l++) {
+            FieldLayer *fl = &ps->field_layers[l];
+            for (int e = 0; e < MAX_EXPERTS; e++)
+                if (fl->experts[e].alive && fl->experts[e].tokens_seen > 0)
+                    a->seen[l * MAX_EXPERTS + e] = 1;
+        }
+}
+
+/* flush: ONE Oja step per alive expert on the turn's MEAN co-activation — the direct
+ * analog of the old per-token rule (one step per turn instead of one per token; the
+ * NOTORCH_RANK-component window rotates across turns, so every component is still
+ * reached over time), then the A14 poison-quarantine. Returns the deaths for
+ * total_deaths. No-op if nothing was generated. */
+static int nt_accum_flush(NotorchTurnAccum *a, GGUFIndex *ps) {
+    if (a->n == 0 || !a->x || !a->dy) return 0;
+    float inv = 1.0f / (float)a->n;
+    for (int i = 0; i < a->dim; i++) { a->x[i] *= inv; a->dy[i] *= inv; }
+    float sig = a->signal * inv;
+    int deaths = 0;
+    for (int l = 0; l < ps->n_field_layers; l++) {
+        FieldLayer *fl = &ps->field_layers[l];
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            if (!fl->experts[e].alive) continue;
+            if (a->seen && !a->seen[l * MAX_EXPERTS + e]) continue; /* only who spoke this turn */
+            notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
+                         ps->host_dim, ps->host_dim, ps->lora_rank,
+                         a->x, a->dy, sig);
+            if (lora_poisoned(fl->experts[e].lora_A, fl->experts[e].lora_B, ps->host_dim * ps->lora_rank)) {
+                fl->experts[e].alive = 0; deaths++;
+            }
+        }
+    }
+    return deaths;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -2110,6 +2610,14 @@ static void mycelium_init(MyceliumState *ms) {
 }
 
 static void mycelium_save(GGUFIndex *ps, int step, float fitness) {
+    /* A13: NaN-quarantine gate — never persist a poisoned spore (else NaN experts survive restart) */
+    for (int l = 0; l < ps->n_field_layers; l++)
+        for (int e = 0; e < MAX_EXPERTS; e++)
+            if (ps->field_layers[l].experts[e].alive &&
+                lora_poisoned(ps->field_layers[l].experts[e].lora_A, ps->field_layers[l].experts[e].lora_B, ps->host_dim * ps->lora_rank)) {
+                printf("[mycelium] poisoned expert L%d e%d (NaN/Inf/|w|>1e4) — spore NOT saved (quarantine)\n", l, e);
+                return;
+            }
     char path[256];
     snprintf(path, 256, "%s/spore_%016llx_s%d.bin", MYCELIUM_DIR,
              (unsigned long long)ps->profile.fingerprint, step);
@@ -2201,8 +2709,10 @@ static int mycelium_load(GGUFIndex *ps, uint64_t target_fp) {
                 ex->alive = 1;
                 fread(&ex->vitality, 4, 1, f);
                 fread(&ex->frequency, 4, 1, f);
-                fread(ex->lora_A, sizeof(float), dim * rank, f);
-                fread(ex->lora_B, sizeof(float), rank * dim, f);
+                if (fread(ex->lora_A, sizeof(float), dim * rank, f) != (size_t)(dim * rank) ||
+                    fread(ex->lora_B, sizeof(float), rank * dim, f) != (size_t)(rank * dim)) {
+                    fclose(f); return 0; /* D-L3: truncated spore — bail, don't load garbage experts */
+                }
             } else if (ex->alive) {
                 free_lora_expert(ex);
             }
@@ -2235,6 +2745,8 @@ typedef struct {
     float *hb, *hb2, *expert_out;
     float *key_cache, *value_cache;
     float *cos_cache, *sin_cache;
+    float *img_embeds;            /* native pixtral image embeds [host_dim * img_count], or NULL */
+    int    img_start, img_count;  /* positions [img_start, img_start+img_count) splice img_embeds */
     HarmonicState hs;
     int max_seq;
 } InferState;
@@ -2251,8 +2763,26 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     s.logits = calloc(ps->host_vocab, 4);
     s.hb = calloc(H, 4); s.hb2 = calloc(H * 2, 4); /* *2 for fused gate_up */
     s.expert_out = calloc(D, 4);
-    s.key_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
-    s.value_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+    /* M4 stage (a): KV-cache on a page-aligned region so the GPU attn_decode
+     * kernel can later resolve it by offset (nt_metal_register_region). Apple
+     * Silicon page = 16384 (getpagesize()), not 4096. CPU attention still reads
+     * it exactly as before — this stage only changes alloc + registration. */
+    size_t kv_bytes = (size_t)ps->host_n_layers * max_seq * kd * 4;
+    if (posix_memalign((void**)&s.key_cache,   (size_t)getpagesize(), kv_bytes) ||
+        posix_memalign((void**)&s.value_cache, (size_t)getpagesize(), kv_bytes)) {
+        fprintf(stderr, "[doe] KV posix_memalign failed — falling back to calloc\n");
+        s.key_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+        s.value_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+    } else {
+        memset(s.key_cache, 0, kv_bytes);
+        memset(s.value_cache, 0, kv_bytes);
+#ifdef USE_METAL
+        if (nt_metal_available()) {
+            nt_metal_register_region(s.key_cache, kv_bytes);
+            nt_metal_register_region(s.value_cache, kv_bytes);
+        }
+#endif
+    }
     int half = ps->host_head_dim / 2;
     s.cos_cache = calloc(max_seq * half, 4);
     s.sin_cache = calloc(max_seq * half, 4);
@@ -2274,6 +2804,7 @@ static void free_infer(InferState *s) {
     free(s->hb); free(s->hb2); free(s->expert_out);
     free(s->key_cache); free(s->value_cache);
     free(s->cos_cache); free(s->sin_cache);
+    free(s->img_embeds);
     memset(s, 0, sizeof(InferState));
 }
 
@@ -2283,32 +2814,252 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     int H = ps->host_hidden;
     int hg = ps->host_heads / ps->host_kv_heads;
     float sc = 1.0f / sqrtf((float)hd);
+    /* per-shape dims for DOE_PERSHAPE matvec grouping (keys pershape_group). */
+    g_ps_D = D; g_ps_qn = ps->host_heads*hd; g_ps_kd = kd; g_ps_H = H; g_ps_H2 = H*2; g_ps_vocab = ps->host_vocab;
 
-    /* Embedding */
-    if (token < ps->host_vocab)
+    /* Embedding (image-aware: splice native pixtral embeds at image positions) */
+    if (s->img_embeds && pos >= s->img_start && pos < s->img_start + s->img_count)
+        memcpy(s->x, s->img_embeds + (size_t)(pos - s->img_start) * D, D * sizeof(float));
+    else if (token >= 0 && token < ps->host_vocab)
         memcpy(s->x, ps->host_tok_emb + token * D, D * sizeof(float));
     else
         memset(s->x, 0, D * sizeof(float));
 
-    for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+    /* ── M4 stage (г): resident decode — the whole token in ONE command buffer.
+     * X lives in SLOT_X on the GPU across all layers; 1 upload + 1 commit + 1
+     * download per token instead of 2 commits + 2 CPU round-trips per layer
+     * (~80 -> ~1 GPU syncs). Requires lora_alpha==0 (no CPU parliament step
+     * between attn and ffn) and every layer slot-eligible. The serial-dispatch
+     * encoder serialises the reused slots, so it is bit-identical to the
+     * per-layer slot path. DOE_NO_RESIDENT falls back. */
+    int resident_done = 0, head_done = 0;
+#ifdef USE_METAL
+    /* alpha==0: pure fast path. alpha!=0 with a registered expert arena: the
+     * parliament (election + LoRA inject) runs on the GPU between attn and ffn,
+     * so x stays resident and the token is still one command buffer. */
+    if (!getenv("DOE_NO_SLOTS") && !getenv("DOE_NO_RESIDENT") && nt_metal_available() &&
+        (ps->lora_alpha == 0.0f || ps->expert_arena_ready)) {
+        int eligible = 1;
+        for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+            if (!ps->host_layers[l].wq) continue;
+            int qd=ps->host_layers[l].wq_dt, kdt=ps->host_layers[l].wk_dt,
+                vd=ps->host_layers[l].wv_dt, od=ps->host_layers[l].wo_dt,
+                ddt=ps->host_layers[l].ffn_down_dt;
+            int fused = ps->host_layers[l].ffn_gate_up != NULL;
+            int gdt = fused ? ps->host_layers[l].ffn_gate_up_dt : ps->host_layers[l].ffn_gate_dt;
+            int udt = fused ? gdt : ps->host_layers[l].ffn_up_dt;
+            int has_ffn = ps->host_layers[l].ffn_down &&
+                          (fused || (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up));
+            if (!ps->host_layers[l].attn_norm || !ps->host_layers[l].ffn_norm || !has_ffn ||
+                ps->host_layers[l].bq || ps->host_layers[l].bk || ps->host_layers[l].bv ||
+                !((qd==12||qd==14)&&(kdt==12||kdt==14)&&(vd==12||vd==14)&&(od==12||od==14)&&
+                  (gdt==12||gdt==14)&&(udt==12||udt==14)&&(ddt==12||ddt==14))) { eligible = 0; break; }
+        }
+        if (eligible) {
+            struct timespec _r0; clock_gettime(CLOCK_MONOTONIC, &_r0);
+            int qn = ps->host_heads * hd;
+            nt_metal_slot_alloc(SLOT_X, D*4);  nt_metal_slot_alloc(SLOT_FN, D*4);
+            nt_metal_slot_alloc(SLOT_Q, qn*4); nt_metal_slot_alloc(SLOT_K, kd*4);
+            nt_metal_slot_alloc(SLOT_V, kd*4); nt_metal_slot_alloc(SLOT_O, qn*4);
+            nt_metal_slot_alloc(SLOT_XB, D*4); nt_metal_slot_alloc(SLOT_G, H*4);
+            nt_metal_slot_alloc(SLOT_U, H*4);  nt_metal_slot_alloc(SLOT_HB, H*4);
+            nt_metal_slot_alloc(SLOT_DN, D*4);
+            nt_metal_slot_upload(SLOT_X, s->x, D*4);
+            /* parliament-on-GPU setup (alpha != 0): per-token resonance + frozen
+             * alive mask + persistent consensus, all resident so the election runs
+             * in-batch. freq[e]=2*pi*e/initial_experts and alive[e] are layer-
+             * independent at inference, so layer 0 is representative. */
+            int parl = (ps->lora_alpha != 0.0f) && ps->expert_arena_ready;
+            if (parl) {
+                int ne = MAX_EXPERTS;
+                nt_metal_slot_alloc(SLOT_PTMP,  (uint64_t)ne*ps->lora_rank*4);
+                nt_metal_slot_alloc(SLOT_PGATE, (uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PVOTES,(uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PRES,  (uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PALIVE,(uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PCONS, (uint64_t)MAX_LAYERS*4);
+                float res[MAX_EXPERTS], alv[MAX_EXPERTS];
+                FieldLayer *fl0 = &ps->field_layers[0];
+                for (int e = 0; e < ne; e++) {
+                    res[e] = 0.1f * expert_resonance(fl0->experts[e].frequency, &s->hs);
+                    alv[e] = fl0->experts[e].alive ? 1.0f : 0.0f;
+                }
+                nt_metal_slot_upload(SLOT_PRES,   res, (uint64_t)ne*4);
+                nt_metal_slot_upload(SLOT_PALIVE, alv, (uint64_t)ne*4);
+                if (!ps->cons_slot_init) {
+                    float cons[MAX_LAYERS];
+                    for (int l = 0; l < MAX_LAYERS; l++)
+                        cons[l] = (l < ps->n_field_layers) ? ps->field_layers[l].parliament.consensus : 0.5f;
+                    nt_metal_slot_upload(SLOT_PCONS, cons, (uint64_t)MAX_LAYERS*4);
+                    ps->cons_slot_init = 1;
+                }
+            }
+            nt_metal_batch_begin();
+            for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
+                if (!ps->host_layers[l].wq) continue;
+                int qd=ps->host_layers[l].wq_dt, kdt=ps->host_layers[l].wk_dt,
+                    vd=ps->host_layers[l].wv_dt, od=ps->host_layers[l].wo_dt,
+                    ddt=ps->host_layers[l].ffn_down_dt;
+                int co2 = l * s->max_seq * kd + pos * kd;
+                float *Kbase = s->key_cache   + (size_t)l * s->max_seq * kd;
+                float *Vbase = s->value_cache + (size_t)l * s->max_seq * kd;
+                const uint8_t *Wdn = (const uint8_t*)ps->host_layers[l].ffn_down;
+                /* attention half-layer */
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
+                if (qd==14)  nt_metal_q6k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                if (kdt==14) nt_metal_q6k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                int rope_norm = g_rope_norm || arch_rope_norm(ps->host_arch);
+                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta, rope_norm);
+                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta, rope_norm);
+                nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
+                nt_metal_copy_to_region(s->value_cache + co2, SLOT_V, kd*4);
+                nt_metal_attn_decode(SLOT_O, SLOT_Q, Kbase, Vbase, pos+1,
+                                     ps->host_heads, ps->host_kv_heads, hd,
+                                     (uint32_t)kd, (uint32_t)hd, (uint32_t)kd, (uint32_t)hd, sc);
+                if (od==14)  nt_metal_q6k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                else         nt_metal_q4k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                nt_metal_add(SLOT_X, SLOT_X, SLOT_XB, D);
+                /* parliament: election (w_vote@x -> variable-k gate) + LoRA inject,
+                 * x += alpha * sum_k w_k * A_k @ (B_k @ x), all on the resident x. */
+                if (parl) {
+                    const float *lb = ps->expert_arena + (size_t)l * ps->expert_layer_floats;
+                    nt_metal_parliament_votes(lb, SLOT_X, SLOT_PVOTES, D, MAX_EXPERTS);
+                    nt_metal_parliament_elect(SLOT_PVOTES, SLOT_PRES, SLOT_PALIVE, SLOT_PCONS,
+                                              SLOT_PGATE, MAX_EXPERTS, l, MIN_EXPERTS);
+                    nt_metal_parliament_inject(SLOT_X, SLOT_PTMP, SLOT_PGATE, lb,
+                                               D, ps->lora_rank, MAX_EXPERTS, ps->lora_alpha);
+                }
+                /* ffn half-layer (fused gate_up or separate gate + up) */
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
+                if (ps->host_layers[l].ffn_gate_up) {
+                    int gdt = ps->host_layers[l].ffn_gate_up_dt;
+                    size_t gu_row = quant_raw_bytes(gdt, D);
+                    const uint8_t *Wgu = (const uint8_t*)ps->host_layers[l].ffn_gate_up;
+                    if (gdt==14) { nt_metal_q6k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q6k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                    else         { nt_metal_q4k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q4k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                } else {
+                    const uint8_t *Wg = (const uint8_t*)ps->host_layers[l].ffn_gate;
+                    const uint8_t *Wu = (const uint8_t*)ps->host_layers[l].ffn_up;
+                    int g2 = ps->host_layers[l].ffn_gate_dt, u2 = ps->host_layers[l].ffn_up_dt;
+                    if (g2==14) nt_metal_q6k_matvec_slot(SLOT_G, Wg, SLOT_FN, H, D);
+                    else        nt_metal_q4k_matvec_slot(SLOT_G, Wg, SLOT_FN, H, D);
+                    if (u2==14) nt_metal_q6k_matvec_slot(SLOT_U, Wu, SLOT_FN, H, D);
+                    else        nt_metal_q4k_matvec_slot(SLOT_U, Wu, SLOT_FN, H, D);
+                }
+                nt_metal_silu_mul(SLOT_HB, SLOT_G, SLOT_U, H);
+                if (ddt==14) nt_metal_q6k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                else         nt_metal_q4k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                nt_metal_add(SLOT_X, SLOT_X, SLOT_DN, D);
+            }
+            /* fold final norm + lm_head into the same command buffer when the
+             * output weight is slot-matvec-able: norm -> lm_head on the GPU,
+             * download logits (vocab) instead of x (dim). One fewer solo
+             * matvec + round-trip. CPU lm_head path runs only when not folded. */
+            int hf = ps->host_norm && ps->host_output && !getenv("DOE_NO_HEADFOLD") &&
+                     (ps->host_output_dt==12 || ps->host_output_dt==14);
+            if (hf) {
+                nt_metal_slot_alloc(SLOT_LOGITS, (uint64_t)ps->host_vocab*4);
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_norm, D, ps->rms_norm_eps);
+                if (ps->host_output_dt==14)
+                    nt_metal_q6k_matvec_slot(SLOT_LOGITS, (const uint8_t*)ps->host_output, SLOT_FN, ps->host_vocab, D);
+                else
+                    nt_metal_q4k_matvec_slot(SLOT_LOGITS, (const uint8_t*)ps->host_output, SLOT_FN, ps->host_vocab, D);
+            }
+            nt_metal_batch_commit();
+            if (hf) { nt_metal_slot_download(SLOT_LOGITS, s->logits, (uint64_t)ps->host_vocab*4); head_done = 1; }
+            else      nt_metal_slot_download(SLOT_X, s->x, D*4);
+            resident_done = 1;
+            struct timespec _r1; clock_gettime(CLOCK_MONOTONIC, &_r1);
+            g_resident_ns += (_r1.tv_sec-_r0.tv_sec)*1e9 + (_r1.tv_nsec-_r0.tv_nsec);
+            if (getenv("DOE_DEBUG_TIMING") && pos == 0)
+                fprintf(stderr, "[resident] engaged: whole token in 1 command buffer (%d layers, parliament=%s)\n",
+                        ps->host_n_layers, parl ? "on" : "off");
+        }
+    }
+#endif
+
+    for (int l = 0; !resident_done && l < ps->host_n_layers && l < MAX_LAYERS; l++) {
         if (!ps->host_layers[l].wq) continue;
 
         /* ── Host attention ── */
+        int attn_done = 0;
+#ifdef USE_METAL
+        /* M4 stage (в): attention half-layer on GPU slots — rmsnorm -> qkv matvecs
+         * -> rope -> copy_to_region(KV) -> attn_decode(GQA) -> o-proj -> residual,
+         * one sync. rope_f32 == doe apply_rope (NeoX pairs, theta^-2i/hd). Guarded
+         * to no-bias archs (Mistral) with Q4_K/Q6_K qkv/wo. CPU fallback otherwise. */
+        {
+            int qd=ps->host_layers[l].wq_dt, kdt=ps->host_layers[l].wk_dt,
+                vd=ps->host_layers[l].wv_dt, od=ps->host_layers[l].wo_dt;
+            if (!getenv("DOE_NO_SLOTS") && nt_metal_available() && ps->host_layers[l].attn_norm &&
+                !ps->host_layers[l].bq && !ps->host_layers[l].bk && !ps->host_layers[l].bv &&
+                (qd==12||qd==14)&&(kdt==12||kdt==14)&&(vd==12||vd==14)&&(od==12||od==14)) {
+                int co2 = l * s->max_seq * kd + pos * kd;
+                float *Kbase = s->key_cache   + (size_t)l * s->max_seq * kd;
+                float *Vbase = s->value_cache + (size_t)l * s->max_seq * kd;
+                int qn = ps->host_heads * hd;
+                nt_metal_slot_alloc(SLOT_X, D*4);   nt_metal_slot_alloc(SLOT_FN, D*4);
+                nt_metal_slot_alloc(SLOT_Q, qn*4);  nt_metal_slot_alloc(SLOT_K, kd*4);
+                nt_metal_slot_alloc(SLOT_V, kd*4);  nt_metal_slot_alloc(SLOT_O, qn*4);
+                nt_metal_slot_alloc(SLOT_XB, D*4);
+                nt_metal_slot_upload(SLOT_X, s->x, D*4);
+                nt_metal_batch_begin();
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
+                if (qd==14)  nt_metal_q6k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                if (kdt==14) nt_metal_q6k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                int rope_norm = g_rope_norm || arch_rope_norm(ps->host_arch);
+                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta, rope_norm);
+                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta, rope_norm);
+                nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
+                nt_metal_copy_to_region(s->value_cache + co2, SLOT_V, kd*4);
+                nt_metal_attn_decode(SLOT_O, SLOT_Q, Kbase, Vbase, pos+1,
+                                     ps->host_heads, ps->host_kv_heads, hd,
+                                     (uint32_t)kd, (uint32_t)hd, (uint32_t)kd, (uint32_t)hd, sc);
+                if (od==14)  nt_metal_q6k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                else         nt_metal_q4k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                nt_metal_add(SLOT_X, SLOT_X, SLOT_XB, D);
+                nt_metal_batch_commit();
+                nt_metal_slot_download(SLOT_X, s->x, D*4);
+                attn_done = 1;
+            }
+        }
+#endif
+        if (!attn_done) {
         float *xn = s->xb;
         if (ps->host_layers[l].attn_norm) rmsnorm(xn, s->x, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
         else memcpy(xn, s->x, D*4);
 
-        matvec(s->q, ps->host_layers[l].wq, xn, ps->host_heads*hd, D);
-        matvec(s->k, ps->host_layers[l].wk, xn, kd, D);
-        matvec(s->v, ps->host_layers[l].wv, xn, kd, D);
+        /* {q,k,v} share xn — batch into one command buffer, one GPU sync (Metal).
+         * out (s->q/k/v) is written only at commit, so commit must precede the
+         * bias adds below that read them. Bit-identical to the solo path. */
+#ifdef USE_METAL
+        int qkv_batch = !getenv("DOE_NO_BATCH") && nt_metal_available() && nt_metal_batch_begin() == 0;
+#endif
+        doe_mv(s->q, ps->host_layers[l].wq, ps->host_layers[l].wq_dt, xn, ps->host_heads*hd, D);
+        doe_mv(s->k, ps->host_layers[l].wk, ps->host_layers[l].wk_dt, xn, kd, D);
+        doe_mv(s->v, ps->host_layers[l].wv, ps->host_layers[l].wv_dt, xn, kd, D);
+#ifdef USE_METAL
+        if (qkv_batch) nt_metal_batch_commit();
+#endif
 
         /* Add attention biases (Qwen2, optional) */
         if (ps->host_layers[l].bq) for (int i = 0; i < ps->host_heads*hd; i++) s->q[i] += ps->host_layers[l].bq[i];
         if (ps->host_layers[l].bk) for (int i = 0; i < kd; i++) s->k[i] += ps->host_layers[l].bk[i];
         if (ps->host_layers[l].bv) for (int i = 0; i < kd; i++) s->v[i] += ps->host_layers[l].bv[i];
 
-        for (int h = 0; h < ps->host_heads; h++) apply_rope(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd);
-        for (int h = 0; h < ps->host_kv_heads; h++) apply_rope(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd);
+        int rope_norm = g_rope_norm || arch_rope_norm(ps->host_arch);
+        for (int h = 0; h < ps->host_heads; h++) apply_rope_mode(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd, rope_norm);
+        for (int h = 0; h < ps->host_kv_heads; h++) apply_rope_mode(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd, rope_norm);
 
         int co = l * s->max_seq * kd + pos * kd;
         memcpy(s->key_cache + co, s->k, kd*4);
@@ -2331,11 +3082,13 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 for (int d = 0; d < hd; d++) oh[d] += a * s->value_cache[vo+d];
             }
         }
-        matvec(s->xb, ps->host_layers[l].wo, ao, D, D);
+        doe_mv(s->xb, ps->host_layers[l].wo, ps->host_layers[l].wo_dt, ao, D, ps->host_heads*hd); /* Y-1b: WO cols = heads*head_dim (4096), not dim (5120) */
         for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
+        } /* !attn_done */
 
         /* ── Parliament election + LoRA injection (after attention, before FFN) ── */
-        if (l < ps->n_field_layers) {
+        /* A13: skip injection entirely when alpha=0 — avoids 0*NaN poisoning from drifted experts */
+        if (l < ps->n_field_layers && ps->lora_alpha != 0.0f) {
             FieldLayer *fl = &ps->field_layers[l];
             int selected[MAX_EXPERTS]; float weights[MAX_EXPERTS];
             int k = parliament_elect(&fl->parliament, fl->experts, s->x, D, &s->hs, selected, weights);
@@ -2360,30 +3113,78 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
 
         /* ── Host FFN (SwiGLU) ── */
         {
+            int ffn_done = 0;
+#ifdef USE_METAL
+            /* M4 stage (b): FFN half-layer on GPU slots — rmsnorm -> gate/up matvecs ->
+             * silu_mul -> down -> residual, one sync. Fused gate_up is split into two
+             * sub-W matvecs (silu_mul needs two slots). x is host-bridged this stage
+             * (attention still CPU); stage (г) keeps x resident. Falls through to the
+             * CPU path when Metal is off or a dt is unsupported by the slot matvec. */
+            {
+                int gdt = ps->host_layers[l].ffn_gate_up_dt, ddt = ps->host_layers[l].ffn_down_dt;
+                if (!getenv("DOE_NO_SLOTS") && nt_metal_available() && ps->host_layers[l].ffn_norm &&
+                    ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down &&
+                    (gdt==12||gdt==14) && (ddt==12||ddt==14)) {
+                    const uint8_t *Wgu = (const uint8_t*)ps->host_layers[l].ffn_gate_up;
+                    const uint8_t *Wdn = (const uint8_t*)ps->host_layers[l].ffn_down;
+                    size_t gu_row = quant_raw_bytes(gdt, D);
+                    nt_metal_slot_alloc(SLOT_X, D*4);  nt_metal_slot_alloc(SLOT_FN, D*4);
+                    nt_metal_slot_alloc(SLOT_G, H*4);  nt_metal_slot_alloc(SLOT_U, H*4);
+                    nt_metal_slot_alloc(SLOT_HB, H*4); nt_metal_slot_alloc(SLOT_DN, D*4);
+                    nt_metal_slot_upload(SLOT_X, s->x, D*4);
+                    nt_metal_batch_begin();
+                    nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
+                    if (gdt==14) { nt_metal_q6k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q6k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                    else         { nt_metal_q4k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q4k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                    nt_metal_silu_mul(SLOT_HB, SLOT_G, SLOT_U, H);
+                    if (ddt==14) nt_metal_q6k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                    else         nt_metal_q4k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                    nt_metal_add(SLOT_X, SLOT_X, SLOT_DN, D);
+                    nt_metal_batch_commit();
+                    nt_metal_slot_download(SLOT_X, s->x, D*4);
+                    ffn_done = 1;
+                }
+            }
+#endif
+            if (!ffn_done) {
             float *fn = s->xb;
             if (ps->host_layers[l].ffn_norm) rmsnorm(fn, s->x, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
             else memcpy(fn, s->x, D*4);
 
             if (ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down) {
                 /* Fused gate_up: [hidden*2, dim] → split into gate [0..H) and up [H..2H) */
-                matvec(s->hb2, ps->host_layers[l].ffn_gate_up, fn, H * 2, D);
+                doe_mv(s->hb2, ps->host_layers[l].ffn_gate_up, ps->host_layers[l].ffn_gate_up_dt, fn, H * 2, D);
                 for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb2[i]) * s->hb2[H + i];
-                matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
+                doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
             } else if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) {
-                /* Standard separate gate + up */
-                matvec(s->hb, ps->host_layers[l].ffn_gate, fn, H, D);
-                matvec(s->hb2, ps->host_layers[l].ffn_up, fn, H, D);
+                /* Standard separate gate + up — share fn, batch into one sync. */
+#ifdef USE_METAL
+                int gu_batch = !getenv("DOE_NO_BATCH") && nt_metal_available() && nt_metal_batch_begin() == 0;
+#endif
+                doe_mv(s->hb, ps->host_layers[l].ffn_gate, ps->host_layers[l].ffn_gate_dt, fn, H, D);
+                doe_mv(s->hb2, ps->host_layers[l].ffn_up, ps->host_layers[l].ffn_up_dt, fn, H, D);
+#ifdef USE_METAL
+                if (gu_batch) nt_metal_batch_commit();
+#endif
                 for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb[i]) * s->hb2[i];
-                matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
+                doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
             }
+            } /* !ffn_done */
         }
     }
 
-    /* Final norm + LM head */
-    rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
-    matvec(s->logits, ps->host_output, s->x, ps->host_vocab, D);
+    /* Final norm + LM head (skipped when folded into the resident CB above) */
+    if (!head_done) {
+        struct timespec _h0; clock_gettime(CLOCK_MONOTONIC, &_h0);
+        rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
+        doe_mv(s->logits, ps->host_output, ps->host_output_dt, s->x, ps->host_vocab, D);
+        struct timespec _h1; clock_gettime(CLOCK_MONOTONIC, &_h1);
+        g_head_ns += (_h1.tv_sec-_h0.tv_sec)*1e9 + (_h1.tv_nsec-_h0.tv_nsec);
+    }
 
     return s->logits;
 }
@@ -2395,9 +3196,27 @@ static int sample(float *logits, int V, float temp, int top_k) {
     if (temp <= 0) { int b = 0; for (int i = 1; i < V; i++) if (logits[i] > logits[b]) b = i; return b; }
     for (int i = 0; i < V; i++) logits[i] /= temp;
     if (top_k > 0 && top_k < V) {
-        float *s = malloc(V*4); memcpy(s, logits, V*4);
-        for (int i = 0; i < top_k; i++) { int b = i; for (int j = i+1; j < V; j++) if (s[j] > s[b]) b = j; float t = s[i]; s[i] = s[b]; s[b] = t; }
-        float th = s[top_k-1]; free(s);
+        /* threshold = top_k-th largest logit via a size-k min-heap: O(V log k),
+         * no per-token malloc. Root holds the smallest of the k kept = same
+         * threshold the old O(k*V) selection-sort produced (value is identical
+         * regardless of tie-breaking), so the sampled token is bit-identical. */
+        float heap[256]; int hk = top_k > 256 ? 256 : top_k; int n = 0;
+        for (int i = 0; i < V; i++) {
+            float v = logits[i];
+            if (n < hk) {
+                int c = n++; heap[c] = v;
+                while (c > 0) { int p=(c-1)/2; if (heap[p] <= heap[c]) break;
+                               float t=heap[p]; heap[p]=heap[c]; heap[c]=t; c=p; }
+            } else if (v > heap[0]) {
+                heap[0] = v; int c = 0;
+                for (;;) { int l=2*c+1, r=2*c+2, m=c;
+                           if (l<hk && heap[l]<heap[m]) m=l;
+                           if (r<hk && heap[r]<heap[m]) m=r;
+                           if (m==c) break;
+                           float t=heap[m]; heap[m]=heap[c]; heap[c]=t; c=m; }
+            }
+        }
+        float th = heap[0];
         for (int i = 0; i < V; i++) if (logits[i] < th) logits[i] = -1e30f;
     }
     softmax_n(logits, V);
@@ -2757,7 +3576,7 @@ static int tokenize_input(GGUFIndex *ps, const char *text, int *tokens, int max_
 }
 
 static void chat(GGUFIndex *ps) {
-    int max_seq = 512;
+    int max_seq = (g_image_path[0] || g_img_embeds_bin[0]) ? 1536 : 512;
     InferState is = alloc_infer(ps, max_seq);
     CalendarDrift cd; drift_init(&cd);
     MetaTrack meta; meta_init(&meta);
@@ -2849,30 +3668,122 @@ static void chat(GGUFIndex *ps) {
         }
         if (!use_template) snprintf(wrapped, sizeof(wrapped), "%s", input);
 
-        /* Tokenize wrapped input */
-        int input_tokens[512];
+        /* Tokenize wrapped input (buffer enlarged for vision: ~1022 image tokens) */
+        int input_tokens[2048];
         int n_input = 0;
-        if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
-        n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
+        if (is.img_embeds) free(is.img_embeds); /* free prior turn's image embeds before reuse (no leak) */
+        is.img_embeds = NULL; is.img_start = 0; is.img_count = 0;
+#ifdef USE_BLAS
+        if (g_image_path[0] || g_img_embeds_bin[0]) {
+            /* native pixtral vision — replicate mtmd layout:
+             * <s> [INST] _ <img_count image embeds> [IMG_END] {prompt} _ [/INST] */
+            int n_img = 0, vdim = ps->host_dim;
+            float *emb = NULL;
+            if (g_img_embeds_bin[0]) {
+                /* diagnostic: load image embeds [n_tok * host_dim] f32 from file (clip ground-truth) */
+                FILE *ef = fopen(g_img_embeds_bin, "rb");
+                if (!ef) { printf("[doe] cannot open img-embeds-bin: %s\n", g_img_embeds_bin); continue; }
+                fseek(ef, 0, SEEK_END); long ne = ftell(ef) / 4; fseek(ef, 0, SEEK_SET);
+                n_img = (int)(ne / ps->host_dim);
+                emb = malloc((size_t)ne * 4);
+                if (fread(emb, 4, ne, ef) != (size_t)ne) { fclose(ef); free(emb); continue; }
+                fclose(ef);
+                printf("[doe] vision: %d image tokens from BIN %s\n", n_img, g_img_embeds_bin);
+            } else {
+                emb = pv_encode_image(g_image_path, g_mmproj_path, &n_img, &vdim);
+                if (!emb) { printf("[doe] image encode failed: %s\n", g_image_path); continue; }
+                if (vdim != ps->host_dim) { printf("[doe] vision dim mismatch: %d != host %d — skipping\n", vdim, ps->host_dim); free(emb); continue; }
+                printf("[doe] vision: %d image tokens (dim %d) from %s\n", n_img, vdim, g_image_path);
+            }
+            int t;
+            if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
+            if ((t = tok_lookup(ps, "[INST]", 6)) >= 0) input_tokens[n_input++] = t;
+            n_input += tokenize_input(ps, " ", input_tokens + n_input, 2048 - n_input);
+            is.img_embeds = emb; is.img_start = n_input;
+            int n_placed = 0;
+            for (int k = 0; k < n_img && n_input < 2000; k++) { input_tokens[n_input++] = (ps->bos_id >= 0 ? ps->bos_id : 0); n_placed++; } /* placeholder, spliced by pos */
+            is.img_count = n_placed; /* splice only the positions actually inserted, never past them */
+            if ((t = tok_lookup(ps, "[IMG_END]", 9)) >= 0 && n_input < 2048) input_tokens[n_input++] = t;
+            char vbuf[1200]; snprintf(vbuf, sizeof vbuf, "%s ", input);
+            int end_inst = tok_lookup(ps, "[/INST]", 7);
+            n_input += tokenize_input(ps, vbuf, input_tokens + n_input, 2048 - n_input - (end_inst >= 0 ? 1 : 0));
+            if (end_inst >= 0 && n_input < 2048) input_tokens[n_input++] = end_inst;
+        } else
+#endif /* USE_BLAS */
+        {
+            if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
+            n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 2048 - n_input);
+        }
+
+        /* A12a: input-id dump WITH bos for parity vs llama (env-guarded, diagnostic only) */
+        if (getenv("DOE_DEBUG_INPUT")) {
+            fprintf(stderr, "[inputdump] n=%d ids:", n_input);
+            for (int di = 0; di < n_input; di++) fprintf(stderr, " %d", input_tokens[di]);
+            fprintf(stderr, "\n");
+        }
+
+        /* A14 (Mythos gen-only): repetition history = GENERATED tokens ONLY — prompt untouched.
+         * A10a poisoned the start by penalizing prompt identity-tokens; here rep_hist stays empty
+         * until generation begins. Window = last ~64 generated (applied below). */
+        int rep_hist[256]; int n_rep = 0;
 
         int pos = 0;
-        for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
+        for (int i = 0; i < n_input - 1 && pos < max_seq - 1; i++, pos++) {
             doe_forward(ps, &is, input_tokens[i], pos);
-            dario_ingest(input_tokens[i]); /* feed user tokens into Dario field */
+            if (!(is.img_embeds && pos >= is.img_start && pos < is.img_start + is.img_count))
+                dario_ingest(input_tokens[i]); /* feed user tokens into Dario field (skip image placeholders) */
         }
 
         int prev = input_tokens[n_input - 1];
+        dario_ingest(prev); /* D-H2: last token still feeds the field; forwarded once in generation */
         printf("  ");
         int total_births = 0, total_deaths = 0;
 
-        for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
+        struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
+        g_prof_mv_ns = 0; g_resident_ns = 0; g_head_ns = 0; /* reset: profile over decode loop only (exclude prefill) */
+        for (int _g = 0; _g < MVG_N; _g++) { g_ps_ns[_g] = 0; g_ps_cnt[_g] = 0; }
+        NotorchTurnAccum nt_acc; nt_accum_init(&nt_acc, ps->host_dim, ps->n_field_layers); /* between-turns learning: accumulate now, step after the turn */
+        for (int i = 0; i < g_gen_max_new && pos < max_seq; i++, pos++) {
+            _gi = i + 1;
             float *lg = doe_forward(ps, &is, prev, pos);
+
+            /* A12b: raw host-forward token-1 NaN/Inf count + finite top-5 (before field/sample) */
+            if (i == 0 && getenv("DOE_DEBUG_LOGITS")) {
+                int V = ps->host_vocab, nnan = 0, ninf = 0;
+                float *tmp = malloc(V * sizeof(float));
+                for (int v = 0; v < V; v++) {
+                    if (isnan(lg[v])) { nnan++; tmp[v] = -1e30f; }
+                    else if (isinf(lg[v])) { ninf++; tmp[v] = -1e30f; }
+                    else tmp[v] = lg[v];
+                }
+                fprintf(stderr, "[logitdump] tok1 nan=%d inf=%d /%d, finite top5:", nnan, ninf, V);
+                for (int top = 0; top < 5; top++) {
+                    int bi = 0; for (int v = 1; v < V; v++) if (tmp[v] > tmp[bi]) bi = v;
+                    const char *ts = (ps->vocab_tokens && ps->vocab_tokens[bi]) ? ps->vocab_tokens[bi] : "?";
+                    fprintf(stderr, " (%d '%s'=%.3f)", bi, ts, tmp[bi]);
+                    tmp[bi] = -1e30f;
+                }
+                fprintf(stderr, "\n");
+                free(tmp);
+            }
 
             /* Field modulation on logits — Dario Equation */
             field_step(1.0f);
             apply_field_to_logits(lg, ps->host_vocab);
 
-            int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
+            /* A10a: repetition penalty over recent history (llama-style), last 64 tokens */
+            if (g_rep_penalty > 1.0f) {
+                int rstart = n_rep > 64 ? n_rep - 64 : 0;
+                for (int r = rstart; r < n_rep; r++) {
+                    int t = rep_hist[r];
+                    if (t >= 0 && t < ps->host_vocab)
+                        lg[t] = lg[t] > 0 ? lg[t] / g_rep_penalty : lg[t] * g_rep_penalty;
+                }
+            }
+
+            float sample_temp = g_gen_temp_override >= 0.0f ? g_gen_temp_override : F.effective_temp;
+            int next = sample(lg, ps->host_vocab, sample_temp, g_gen_top_k);
+            if (n_rep < 256) rep_hist[n_rep++] = next;
 
             /* Stop on EOS or chat-template end tokens */
             if (next == ps->eos_id) break;
@@ -2893,17 +3804,12 @@ static void chat(GGUFIndex *ps) {
             /* Dario field: ingest generated token (co-occurrence + prophecy + destiny) */
             dario_ingest(next);
 
-            /* NOTORCH Hebbian update — debt drives learning */
+            /* NOTORCH Hebbian update — debt drives learning (A13b: gated by --train).
+             * Between-turns (2026-06-20): accumulate the co-activation now, take one
+             * bounded Oja step per expert AFTER the turn (nt_accum_flush below) so the
+             * experts don't re-sew the words they are still speaking. */
             float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
-            for (int l = 0; l < ps->n_field_layers; l++) {
-                FieldLayer *fl = &ps->field_layers[l];
-                for (int e = 0; e < MAX_EXPERTS; e++) {
-                    if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
-                    notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
-                                ps->host_dim, ps->host_dim, ps->lora_rank,
-                                is.x, is.xb, learn_signal);
-                }
-            }
+            if (g_train) nt_accum_add(&nt_acc, ps, is.x, is.xb, learn_signal);
 
             /* Vitality + mitosis + apoptosis */
             if (i % 10 == 0) {
@@ -2927,6 +3833,32 @@ static void chat(GGUFIndex *ps) {
             fflush(stdout);
             prev = next;
         }
+        /* between-turns: the parliament reflects on the whole turn, once it is spoken */
+        if (g_train) total_deaths += nt_accum_flush(&nt_acc, ps);
+        nt_accum_free(&nt_acc);
+        clock_gettime(CLOCK_MONOTONIC, &_gt1);
+        if (getenv("DOE_DEBUG_TIMING") || g_prof_on > 0) {
+            double _el = (_gt1.tv_sec - _gt0.tv_sec) + (_gt1.tv_nsec - _gt0.tv_nsec) / 1e9;
+            fprintf(stderr, "[timing] decode %d tokens in %.2fs = %.2f t/s\n", _gi, _el, _el > 0 ? _gi / _el : 0.0);
+            if (g_prof_on > 0) {
+                double _mv = g_prof_mv_ns / 1e9;
+                fprintf(stderr, "[profile] matvec %.2fs (%.0f%% of decode) | rest %.2fs (attention/rmsnorm/FFN/sample)\n",
+                        _mv, _el > 0 ? 100 * _mv / _el : 0.0, _el - _mv);
+                double _res = g_resident_ns/1e9, _hd = g_head_ns/1e9;
+                fprintf(stderr, "[profile] resident-CB %.2fs (%.0f%%, %.1f ms/tok) | lm_head+norm %.2fs (%.0f%%, %.1f ms/tok) | other %.2fs\n",
+                        _res, _el>0?100*_res/_el:0.0, _gi>0?_res*1e3/_gi:0.0,
+                        _hd, _el>0?100*_hd/_el:0.0, _gi>0?_hd*1e3/_gi:0.0, _el-_res-_hd);
+            }
+            if (g_ps_on > 0 && _gi > 0) {
+                static const char *_gn[MVG_N] = {"attn_qkv","attn_o","ffn_gate_up","ffn_down","lm_head"};
+                double _tot = 0; for (int _g = 0; _g < MVG_N; _g++) _tot += g_ps_ns[_g];
+                fprintf(stderr, "[per-shape] %d tokens, per-token (bytes-share check):\n", _gi);
+                for (int _g = 0; _g < MVG_N; _g++)
+                    fprintf(stderr, "  %-12s %.3f ms/tok  %.1f disp/tok  (m=%d k=%d dt=%d)  %.0f%% time\n",
+                            _gn[_g], g_ps_ns[_g]/1e6/_gi, (double)g_ps_cnt[_g]/_gi,
+                            g_ps_m[_g], g_ps_k[_g], g_ps_dt[_g], _tot > 0 ? 100*g_ps_ns[_g]/_tot : 0.0);
+            }
+        }
         printf("\n");
 
         /* Meta record */
@@ -2939,6 +3871,7 @@ static void chat(GGUFIndex *ps) {
         if (total_births > 0 || total_deaths > 0)
             printf("  [life] births=%d deaths=%d\n", total_births, total_deaths);
         printf("\n");
+        if (g_once) break;
     }
     free_infer(&is);
 }
@@ -2948,6 +3881,7 @@ static void chat(GGUFIndex *ps) {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static int g_serve_port = 0; /* 0 = disabled */
+static int g_serve_public = 0; /* D-M4: 0 = bind 127.0.0.1 (default), 1 = 0.0.0.0 (--serve-public) */
 
 /* JSON-escape a string into buf. Returns bytes written (not counting NUL). */
 static int json_escape(const char *src, char *buf, int bufsz) {
@@ -3090,7 +4024,7 @@ static float json_get_float(const char *json, const char *key, float def) {
 
 /* Run inference and stream SSE tokens */
 static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, float temperature, int max_tokens) {
-    int max_seq = 512;
+    int max_seq = (g_image_path[0] || g_img_embeds_bin[0]) ? 1536 : 512;
     InferState is = alloc_infer(ps, max_seq);
 
     /* Reset KV cache */
@@ -3118,14 +4052,16 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
 
     /* Prefill */
     int pos = 0;
-    for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
+    for (int i = 0; i < n_input - 1 && pos < max_seq - 1; i++, pos++) {
         doe_forward(ps, &is, input_tokens[i], pos);
         dario_ingest(input_tokens[i]); /* feed user tokens into Dario field */
     }
 
     int prev = input_tokens[n_input - 1];
+    dario_ingest(prev); /* D-H2: last token still feeds the field; forwarded once in generation */
 
     /* Generate tokens, stream as SSE */
+    NotorchTurnAccum nt_acc; nt_accum_init(&nt_acc, ps->host_dim, ps->n_field_layers); /* between-turns learning: accumulate now, step after the turn */
     for (int i = 0; i < max_tokens && pos < max_seq; i++, pos++) {
         float *lg = doe_forward(ps, &is, prev, pos);
         field_step(1.0f);
@@ -3151,16 +4087,10 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
         /* Dario field: ingest generated token */
         dario_ingest(next);
 
+        /* between-turns (2026-06-20): accumulate now, one Oja step per expert after the
+         * stream completes (nt_accum_flush below) — no mid-stream re-sewing. */
         float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
-        for (int l = 0; l < ps->n_field_layers; l++) {
-            FieldLayer *fl = &ps->field_layers[l];
-            for (int e = 0; e < MAX_EXPERTS; e++) {
-                if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
-                notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
-                            ps->host_dim, ps->host_dim, ps->lora_rank,
-                            is.x, is.xb, learn_signal);
-            }
-        }
+        if (g_train) nt_accum_add(&nt_acc, ps, is.x, is.xb, learn_signal);
 
         /* Decode token to buffer */
         char tokbuf[256], escaped[512];
@@ -3175,9 +4105,12 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
 
         prev = next;
     }
+    /* between-turns: the parliament reflects on the whole stream, once it is spoken */
+    if (g_train) nt_accum_flush(&nt_acc, ps);
+    nt_accum_free(&nt_acc);
 
     /* Send done event */
-    write(fd, "data: {\"done\":true}\n\n", 20);
+    write(fd, "data: {\"done\":true}\n\n", 21); /* D-L2: full 21 bytes incl. both \n */
     free_infer(&is);
 }
 
@@ -3193,7 +4126,7 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = g_serve_public ? INADDR_ANY : htonl(INADDR_LOOPBACK); /* D-M4: localhost by default */
     addr.sin_port = htons(g_serve_port);
 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -3208,7 +4141,7 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
     snprintf(ui_path, sizeof(ui_path), "%sdoe_ui.html", exe_dir);
     snprintf(vis_path, sizeof(vis_path), "%sdoe.html", exe_dir);
 
-    printf("[serve] parliament listening on http://0.0.0.0:%d\n", g_serve_port);
+    printf("[serve] parliament listening on http://%s:%d\n", g_serve_public ? "0.0.0.0" : "127.0.0.1", g_serve_port);
     printf("[serve]   /         → chat UI\n");
     printf("[serve]   /visual   → parliament terminal\n");
     printf("[serve]   /health   → status\n");
@@ -3267,6 +4200,22 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
                     F.debt, F.field_health);
                 http_send_header(client, 200, "application/json", blen);
                 http_send(client, body, blen);
+            } else if (strcmp(path, "/logo.svg") == 0) {
+                /* DOE mark — central node + a hexagon of experts (Democracy of Experts) */
+                static const char *logo =
+                    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' width='32' height='32'>"
+                    "<rect width='32' height='32' rx='7' fill='#0d0d0d'/>"
+                    "<g stroke='#374151' stroke-width='1'>"
+                    "<line x1='16' y1='16' x2='16' y2='6.6'/><line x1='16' y1='16' x2='24.1' y2='11.3'/>"
+                    "<line x1='16' y1='16' x2='24.1' y2='20.7'/><line x1='16' y1='16' x2='16' y2='25.4'/>"
+                    "<line x1='16' y1='16' x2='7.9' y2='20.7'/><line x1='16' y1='16' x2='7.9' y2='11.3'/></g>"
+                    "<g fill='#9ca3af'>"
+                    "<circle cx='16' cy='6.6' r='2'/><circle cx='24.1' cy='11.3' r='2'/>"
+                    "<circle cx='24.1' cy='20.7' r='2'/><circle cx='16' cy='25.4' r='2'/>"
+                    "<circle cx='7.9' cy='20.7' r='2'/><circle cx='7.9' cy='11.3' r='2'/></g>"
+                    "<circle cx='16' cy='16' r='3.4' fill='#ffffff'/></svg>";
+                http_send_header(client, 200, "image/svg+xml", (int)strlen(logo));
+                http_send(client, logo, (int)strlen(logo));
             } else {
                 const char *msg = "not found";
                 http_send_header(client, 404, "text/plain", (int)strlen(msg));
@@ -3309,6 +4258,348 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
 /* ═══════════════════════════════════════════════════════════════════════════════
  * MAIN — the field manifests.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+#ifdef USE_BLAS  /* native pixtral vision — cblas-dependent, BLAS/metal builds only */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * NATIVE PIXTRAL VISION ENCODER — inlined from the verified yent module.
+ * preprocess -> patch conv -> 24x ViT(2D-rope) -> merger -> GELU projector -> IMG_BREAK.
+ * e2e rel 1.9% vs llama.cpp clip. Zero llama.cpp at runtime (cblas + gguf.c + stb).
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+// ── Pixtral constants (clip.cpp:1319-1329, clip-model.h:131-137, gguf hparams) ──
+#define PV_PATCH   14
+#define PV_NMERGE  2
+#define PV_ALIGN   (PV_PATCH * PV_NMERGE)        // 28
+#define PV_DHEAD   64
+#define PV_NHEAD   16
+#define PV_EPS     1e-5f
+#define PV_ROPE_THETA 10000.0f
+static const long  PV_MIN_PX = 6272;             // 8    * (14*14*2*2)=784
+static const long  PV_MAX_PX = 802816;           // 1024 * 784
+static const float PV_MEAN[3] = {0.48145466f, 0.45782750f, 0.40821073f};
+static const float PV_STD[3]  = {0.26862954f, 0.26130258f, 0.27577711f};
+
+static int pv_imax(int a, int b) { return a > b ? a : b; }
+static int pv_imin(int a, int b) { return a < b ? a : b; }
+static int pv_round_by(double x) { return (int)(round(x / PV_ALIGN) * PV_ALIGN); }
+static int pv_ceil_by (double x) { return (int)(ceil (x / PV_ALIGN) * PV_ALIGN); }
+static int pv_floor_by(double x) { return (int)(floor(x / PV_ALIGN) * PV_ALIGN); }
+
+// ── Stage 1: preprocessing (smart_resize + bilinear + PAD_CEIL + normalize + planar) ──
+static void pv_smart_resize(int W, int H, int *tw, int *th) {
+    int h_bar = pv_imax(PV_ALIGN, pv_round_by(H));
+    int w_bar = pv_imax(PV_ALIGN, pv_round_by(W));
+    if ((long)h_bar * w_bar > PV_MAX_PX) {
+        double beta = sqrt((double)H * W / (double)PV_MAX_PX);
+        h_bar = pv_imax(PV_ALIGN, pv_floor_by(H / beta));
+        w_bar = pv_imax(PV_ALIGN, pv_floor_by(W / beta));
+    } else if ((long)h_bar * w_bar < PV_MIN_PX) {
+        double beta = sqrt((double)PV_MIN_PX / ((double)H * W));
+        h_bar = pv_ceil_by(H * beta);
+        w_bar = pv_ceil_by(W * beta);
+    }
+    *tw = w_bar; *th = h_bar;
+}
+
+static void pv_resize_bilinear_u8(const unsigned char *src, int sw, int sh,
+                                  unsigned char *dst, int tw, int th) {
+    float x_ratio = tw > 1 ? (float)(sw - 1) / (tw - 1) : 0.f;
+    float y_ratio = th > 1 ? (float)(sh - 1) / (th - 1) : 0.f;
+    for (int y = 0; y < th; y++) {
+        float py = y * y_ratio;
+        int y0 = pv_imin((int)py, sh - 1), y1 = pv_imin(y0 + 1, sh - 1);
+        float yf = py - y0;
+        for (int x = 0; x < tw; x++) {
+            float px = x * x_ratio;
+            int x0 = pv_imin((int)px, sw - 1), x1 = pv_imin(x0 + 1, sw - 1);
+            float xf = px - x0;
+            for (int c = 0; c < 3; c++) {
+                float tl = src[3 * (y0 * sw + x0) + c], tr = src[3 * (y0 * sw + x1) + c];
+                float bl = src[3 * (y1 * sw + x0) + c], br = src[3 * (y1 * sw + x1) + c];
+                float top = tl + (tr - tl) * xf, bot = bl + (br - bl) * xf;
+                dst[3 * (y * tw + x) + c] = (unsigned char)(top + (bot - top) * yf); // trunc
+            }
+        }
+    }
+}
+
+float *pv_preprocess(const char *path, int *onx, int *ony) {
+    int W, H, ch;
+    unsigned char *img = stbi_load(path, &W, &H, &ch, 3);
+    if (!img) { fprintf(stderr, "pv: cannot load %s\n", path); return NULL; }
+    int tw, th;
+    pv_smart_resize(W, H, &tw, &th);
+    float scale_w = (float)tw / W, scale_h = (float)th / H;
+    float scale = scale_w < scale_h ? scale_w : scale_h;
+    int new_w = pv_imin((int)ceil(W * scale), tw);
+    int new_h = pv_imin((int)ceil(H * scale), th);
+    unsigned char *tmp = (unsigned char *)malloc((size_t)new_w * new_h * 3);
+    pv_resize_bilinear_u8(img, W, H, tmp, new_w, new_h);
+    unsigned char *canvas = (unsigned char *)calloc((size_t)tw * th * 3, 1);
+    int ox = (tw - new_w) / 2, oy = (th - new_h) / 2;
+    for (int y = 0; y < new_h; y++)
+        memcpy(canvas + 3 * ((size_t)(oy + y) * tw + ox), tmp + 3 * (size_t)y * new_w, (size_t)new_w * 3);
+    long n = (long)tw * th;
+    float *out = (float *)malloc((size_t)n * 3 * sizeof(float));
+    for (long i = 0; i < n; i++)
+        for (int c = 0; c < 3; c++)
+            out[(long)c * n + i] = (canvas[3 * i + c] / 255.0f - PV_MEAN[c]) / PV_STD[c];
+    free(img); free(tmp); free(canvas);
+    *onx = tw; *ony = th;
+    return out;
+}
+
+// ── Stage 2: patch_embed conv (v.patch_embd[14,14,3,1024] stride14, no pad/bias) ──
+// inp planar [W,H,3]; out [n_embd,n_pos] oc-fastest, patch=ow+OW*oh. w[kx+14ky+196ci+588oc].
+float *pv_patch_embed(const float *inp, int W, int H, gguf_file *gf, int *o_npos, int *o_nembd) {
+    int idx = gguf_find_tensor(gf, "v.patch_embd.weight");
+    if (idx < 0) { fprintf(stderr, "pv: v.patch_embd.weight not found\n"); return NULL; }
+    int NE = (int)gf->tensors[idx].shape[3];
+    float *w = gguf_dequant(gf, idx);
+    if (!w) return NULL;
+    int OW = W / PV_PATCH, OH = H / PV_PATCH, n_pos = OW * OH;
+    float *out = (float *)malloc((size_t)NE * n_pos * sizeof(float));
+    for (int patch = 0; patch < n_pos; patch++) {
+        int oh = patch / OW, ow = patch % OW;
+        for (int oc = 0; oc < NE; oc++) {
+            float acc = 0.f;
+            const float *wo = w + (size_t)oc * 588;
+            for (int ci = 0; ci < 3; ci++)
+                for (int ky = 0; ky < PV_PATCH; ky++) {
+                    const float *row = inp + (size_t)ci * W * H + (size_t)(oh * PV_PATCH + ky) * W + ow * PV_PATCH;
+                    const float *wk = wo + ci * 196 + ky * PV_PATCH;
+                    for (int kx = 0; kx < PV_PATCH; kx++) acc += wk[kx] * row[kx];
+                }
+            out[oc + (size_t)NE * patch] = acc;
+        }
+    }
+    free(w);
+    *o_npos = n_pos; *o_nembd = NE;
+    return out;
+}
+
+// ── Stage 3: 24-layer Pixtral ViT trunk ──
+static float *pv_dq(gguf_file *gf, const char *name) {
+    int idx = gguf_find_tensor(gf, name);
+    if (idx < 0) { fprintf(stderr, "pv: %s missing\n", name); return NULL; }
+    return gguf_dequant(gf, idx);
+}
+// out[o + outd*p] = sum_i W[i+in*o] * x[i+in*p]   (== W^T x, col-major); W ne=[in,out].
+static void pv_matmul(const float *W, const float *x, float *out, int in, int outd, int n_pos) {
+    cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans, outd, n_pos, in,
+                1.0f, W, in, x, in, 0.0f, out, outd);
+}
+static void pv_rmsnorm(const float *x, const float *w, float *out, int n_embd, int n_pos, float eps) {
+    for (int p = 0; p < n_pos; p++) {
+        const float *c = x + (size_t)n_embd * p; float *o = out + (size_t)n_embd * p;
+        double ss = 0; for (int e = 0; e < n_embd; e++) ss += (double)c[e] * c[e];
+        float inv = 1.0f / sqrtf((float)(ss / n_embd) + eps);
+        for (int e = 0; e < n_embd; e++) o[e] = c[e] * inv * w[e];
+    }
+}
+// 2D-RoPE on [d_head=64, n_head, n_pos], mode=0 adjacent pairs (build_rope_2d, ggml NORMAL).
+static void pv_rope2d(float *Q, const int *ph, const int *pw, int n_pos) {
+    for (int p = 0; p < n_pos; p++) {
+        float fph = (float)ph[p], fpw = (float)pw[p];
+        for (int h = 0; h < PV_NHEAD; h++) {
+            float *q = Q + (size_t)PV_DHEAD * h + (size_t)PV_DHEAD * PV_NHEAD * p;
+            for (int j = 0; j < 16; j++) {
+                float th  = fph * powf(PV_ROPE_THETA, -2.0f * j / 32.0f);
+                float c = cosf(th), s = sinf(th);
+                float a = q[2 * j], b = q[2 * j + 1];
+                q[2 * j] = a * c - b * s; q[2 * j + 1] = a * s + b * c;
+                float th2 = fpw * powf(PV_ROPE_THETA, -(2.0f * j + 1.0f) / 32.0f);
+                float c2 = cosf(th2), s2 = sinf(th2);
+                float a2 = q[32 + 2 * j], b2 = q[32 + 2 * j + 1];
+                q[32 + 2 * j] = a2 * c2 - b2 * s2; q[32 + 2 * j + 1] = a2 * s2 + b2 * c2;
+            }
+        }
+    }
+}
+static float pv_silu(float x) { return x / (1.0f + expf(-x)); }
+
+// Full ViT trunk: x = conv [n_embd,n_pos] -> trunk [n_embd,n_pos] (in place). Returns x.
+float *pv_vit_trunk(float *x, int NE, int n_pos, gguf_file *gf, const int *ph, const int *pw) {
+    const int NF = 4096;
+    const float scale = 1.0f / sqrtf((float)PV_DHEAD);
+    char nm[128];
+    // pre_ln (RMSNorm) before blocks, if present.
+    int pidx = gguf_find_tensor(gf, "v.pre_ln.weight");
+    if (pidx >= 0) {
+        float *w = gguf_dequant(gf, pidx);
+        float *t = (float *)malloc((size_t)NE * n_pos * 4);
+        pv_rmsnorm(x, w, t, NE, n_pos, PV_EPS);
+        memcpy(x, t, (size_t)NE * n_pos * 4);
+        free(t); free(w);
+    }
+    float *nrm = (float *)malloc((size_t)NE * n_pos * 4);
+    float *Q = (float *)malloc((size_t)NE * n_pos * 4);
+    float *K = (float *)malloc((size_t)NE * n_pos * 4);
+    float *V = (float *)malloc((size_t)NE * n_pos * 4);
+    float *Oc = (float *)malloc((size_t)NE * n_pos * 4);
+    float *Qh = (float *)malloc((size_t)PV_DHEAD * n_pos * 4);
+    float *Kh = (float *)malloc((size_t)PV_DHEAD * n_pos * 4);
+    float *Vh = (float *)malloc((size_t)PV_DHEAD * n_pos * 4);
+    float *Oh = (float *)malloc((size_t)PV_DHEAD * n_pos * 4);
+    float *S = (float *)malloc((size_t)n_pos * n_pos * 4);
+    float *g = (float *)malloc((size_t)NF * n_pos * 4);
+    float *u = (float *)malloc((size_t)NF * n_pos * 4);
+
+    for (int l = 0; l < 24; l++) {
+        // ── attention ──
+        snprintf(nm, sizeof nm, "v.blk.%d.ln1.weight", l); float *ln1 = pv_dq(gf, nm);
+        pv_rmsnorm(x, ln1, nrm, NE, n_pos, PV_EPS); free(ln1);
+        snprintf(nm, sizeof nm, "v.blk.%d.attn_q.weight", l); float *qw = pv_dq(gf, nm); pv_matmul(qw, nrm, Q, NE, NE, n_pos); free(qw);
+        snprintf(nm, sizeof nm, "v.blk.%d.attn_k.weight", l); float *kw = pv_dq(gf, nm); pv_matmul(kw, nrm, K, NE, NE, n_pos); free(kw);
+        snprintf(nm, sizeof nm, "v.blk.%d.attn_v.weight", l); float *vw = pv_dq(gf, nm); pv_matmul(vw, nrm, V, NE, NE, n_pos); free(vw);
+        pv_rope2d(Q, ph, pw, n_pos);
+        pv_rope2d(K, ph, pw, n_pos);
+        for (int h = 0; h < PV_NHEAD; h++) {
+            for (int p = 0; p < n_pos; p++) {
+                memcpy(Qh + (size_t)PV_DHEAD * p, Q + (size_t)PV_DHEAD * h + (size_t)NE * p, PV_DHEAD * 4);
+                memcpy(Kh + (size_t)PV_DHEAD * p, K + (size_t)PV_DHEAD * h + (size_t)NE * p, PV_DHEAD * 4);
+                memcpy(Vh + (size_t)PV_DHEAD * p, V + (size_t)PV_DHEAD * h + (size_t)NE * p, PV_DHEAD * 4);
+            }
+            // S[pk + n_pos*pq] = scale * sum_d Kh[d,pk] Qh[d,pq]
+            cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans, n_pos, n_pos, PV_DHEAD,
+                        scale, Kh, PV_DHEAD, Qh, PV_DHEAD, 0.0f, S, n_pos);
+            for (int pq = 0; pq < n_pos; pq++) {
+                float *col = S + (size_t)n_pos * pq;
+                float mx = col[0];
+                for (int pk = 1; pk < n_pos; pk++) if (col[pk] > mx) mx = col[pk];
+                float sm = 0;
+                for (int pk = 0; pk < n_pos; pk++) { col[pk] = expf(col[pk] - mx); sm += col[pk]; }
+                float iv = 1.0f / sm;
+                for (int pk = 0; pk < n_pos; pk++) col[pk] *= iv;
+            }
+            // Oh[d,pq] = sum_pk Vh[d,pk] S[pk,pq]
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, PV_DHEAD, n_pos, n_pos,
+                        1.0f, Vh, PV_DHEAD, S, n_pos, 0.0f, Oh, PV_DHEAD);
+            for (int p = 0; p < n_pos; p++)
+                memcpy(Oc + (size_t)PV_DHEAD * h + (size_t)NE * p, Oh + (size_t)PV_DHEAD * p, PV_DHEAD * 4);
+        }
+        snprintf(nm, sizeof nm, "v.blk.%d.attn_out.weight", l); float *ow = pv_dq(gf, nm); pv_matmul(ow, Oc, nrm, NE, NE, n_pos); free(ow);
+        for (size_t i = 0; i < (size_t)NE * n_pos; i++) x[i] += nrm[i];   // residual 1
+        // ── ffn (SwiGLU) ──
+        snprintf(nm, sizeof nm, "v.blk.%d.ln2.weight", l); float *ln2 = pv_dq(gf, nm);
+        pv_rmsnorm(x, ln2, nrm, NE, n_pos, PV_EPS); free(ln2);
+        snprintf(nm, sizeof nm, "v.blk.%d.ffn_gate.weight", l); float *gw = pv_dq(gf, nm); pv_matmul(gw, nrm, g, NE, NF, n_pos); free(gw);
+        snprintf(nm, sizeof nm, "v.blk.%d.ffn_up.weight", l);   float *uw = pv_dq(gf, nm); pv_matmul(uw, nrm, u, NE, NF, n_pos); free(uw);
+        for (size_t i = 0; i < (size_t)NF * n_pos; i++) g[i] = pv_silu(g[i]) * u[i];
+        snprintf(nm, sizeof nm, "v.blk.%d.ffn_down.weight", l); float *dw = pv_dq(gf, nm); pv_matmul(dw, g, nrm, NF, NE, n_pos); free(dw);
+        for (size_t i = 0; i < (size_t)NE * n_pos; i++) x[i] += nrm[i];   // residual 2
+    }
+    free(nrm); free(Q); free(K); free(V); free(Oc);
+    free(Qh); free(Kh); free(Vh); free(Oh); free(S); free(g); free(u);
+    return x; // no post_ln for pixtral
+}
+
+// ── Stage 4: patch merger (mistral small 3.1) ──
+// trunk [NE, n_pos] (e+NE*p, p=ow+npx*oh) -> merged [NE, nm] (o+NE*t, t=ow_m+OWm*oh_m).
+// RMSNorm(mm_input_norm) -> im2col 2x2 (vec c=kx+2ky+4ic) -> mm_patch_merger[4096->1024].
+float *pv_merger(const float *trunk, int NE, int npx, int npy, gguf_file *gf, int *o_nm) {
+    int n_pos = npx * npy;
+    float *inw = pv_dq(gf, "mm.input_norm.weight");
+    if (!inw) return NULL;
+    float *yn = (float *)malloc((size_t)NE * n_pos * 4);
+    pv_rmsnorm(trunk, inw, yn, NE, n_pos, PV_EPS); free(inw);
+    int M = NE * 4;                 // 4096
+    int OWm = npx / 2, OHm = npy / 2, nm = OWm * OHm;
+    float *mw = pv_dq(gf, "mm.patch_merger.weight"); // ne=[4096,1024], W[c+4096*o]
+    if (!mw) { free(yn); return NULL; }
+    float *VEC = (float *)malloc((size_t)M * nm * 4);
+    for (int ohm = 0; ohm < OHm; ohm++)
+        for (int owm = 0; owm < OWm; owm++) {
+            int t = owm + OWm * ohm;
+            float *vc = VEC + (size_t)M * t;
+            for (int ic = 0; ic < NE; ic++)
+                for (int ky = 0; ky < 2; ky++)
+                    for (int kx = 0; kx < 2; kx++) {
+                        int X = 2 * owm + kx, Y = 2 * ohm + ky;
+                        vc[kx + 2 * ky + 4 * ic] = yn[ic + (size_t)NE * (X + npx * Y)];
+                    }
+        }
+    float *out = (float *)malloc((size_t)NE * nm * 4);
+    pv_matmul(mw, VEC, out, M, NE, nm);   // out[o+NE*t] = sum_c mw[c+M*o] VEC[c+M*t]
+    free(yn); free(mw); free(VEC);
+    *o_nm = nm;
+    return out;
+}
+
+static float pv_gelu(float x) { // ggml_gelu tanh approximation
+    return 0.5f * x * (1.0f + tanhf(0.79788456080286535588f * x * (1.0f + 0.044715f * x * x)));
+}
+static void pv_add_bias(float *x, const float *b, int outd, int n_pos) {
+    for (int p = 0; p < n_pos; p++) { float *c = x + (size_t)outd * p; for (int o = 0; o < outd; o++) c[o] += b[o]; }
+}
+
+// ── Stage 5: LlavaMultiModalProjector (mm_1 -> GELU -> mm_2), always GELU ──
+// merged [NE, nm] -> proj [5120, nm].
+float *pv_projector(const float *merged, int NE, int nm, gguf_file *gf, int *o_dim) {
+    int i1 = gguf_find_tensor(gf, "mm.1.weight"), i2 = gguf_find_tensor(gf, "mm.2.weight");
+    if (i1 < 0 || i2 < 0) { fprintf(stderr, "pv: mm.1/mm.2 missing\n"); return NULL; }
+    int hid = (int)gf->tensors[i1].shape[1];   // mm.1 out dim
+    int dim = (int)gf->tensors[i2].shape[1];   // mm.2 out dim = 5120
+    float *w1 = gguf_dequant(gf, i1), *w2 = gguf_dequant(gf, i2);
+    float *h = (float *)malloc((size_t)hid * nm * 4);
+    pv_matmul(w1, merged, h, NE, hid, nm);     // mm.1
+    int bi1 = gguf_find_tensor(gf, "mm.1.bias");
+    if (bi1 >= 0) { float *b = gguf_dequant(gf, bi1); pv_add_bias(h, b, hid, nm); free(b); }
+    for (size_t i = 0; i < (size_t)hid * nm; i++) h[i] = pv_gelu(h[i]);
+    float *out = (float *)malloc((size_t)dim * nm * 4);
+    pv_matmul(w2, h, out, hid, dim, nm);       // mm.2
+    int bi2 = gguf_find_tensor(gf, "mm.2.bias");
+    if (bi2 >= 0) { float *b = gguf_dequant(gf, bi2); pv_add_bias(out, b, dim, nm); free(b); }
+    free(w1); free(w2); free(h);
+    *o_dim = dim;
+    return out;
+}
+
+// ── Stage 6: [IMG_BREAK] arrangement (POST-projector, dim 5120) ──
+// proj [D, nm] (col = px_m + OWm*py_m) -> stream [D, OWm*OHm + OHm-1]; img_break after each row except last.
+float *pv_img_break(const float *proj, int D, int OWm, int OHm, gguf_file *gf, int *o_ntok) {
+    float *ib = pv_dq(gf, "v.token_embd.img_break");  // [D]
+    if (!ib) return NULL;
+    int ntok = OWm * OHm + OHm - 1;
+    float *out = (float *)malloc((size_t)D * ntok * 4);
+    int k = 0;
+    for (int y = 0; y < OHm; y++) {
+        for (int x = 0; x < OWm; x++) { memcpy(out + (size_t)D * k, proj + (size_t)D * (x + OWm * y), (size_t)D * 4); k++; }
+        if (y < OHm - 1) { memcpy(out + (size_t)D * k, ib, (size_t)D * 4); k++; }
+    }
+    free(ib);
+    *o_ntok = ntok;
+    return out;
+}
+
+// ── Public entry: full pipeline image path -> image embeddings [n_embd_text, n_tok] ──
+// Returns malloc'd [dim * ntok] f32 (token-major: out[e + dim*k] = token k, embd e).
+// Caller frees. *o_ntok = number of image tokens (incl IMG_BREAK rows), *o_dim = 5120.
+float *pv_encode_image(const char *img_path, const char *mmproj_path, int *o_ntok, int *o_dim) {
+    int nx, ny;
+    float *inp = pv_preprocess(img_path, &nx, &ny);
+    if (!inp) return NULL;
+    gguf_file *gf = gguf_open(mmproj_path);
+    if (!gf) { fprintf(stderr, "pv: cannot open mmproj %s\n", mmproj_path); free(inp); return NULL; }
+    int npos, nembd;
+    float *cur = pv_patch_embed(inp, nx, ny, gf, &npos, &nembd);
+    free(inp);
+    if (!cur) { gguf_close(gf); return NULL; }
+    int npx = nx / PV_PATCH, npy = ny / PV_PATCH;
+    int *ph = (int *)malloc((size_t)npos * 4), *pw = (int *)malloc((size_t)npos * 4);
+    for (int i = 0; i < npos; i++) { ph[i] = i / npx; pw[i] = i % npx; }
+    cur = pv_vit_trunk(cur, nembd, npos, gf, ph, pw);
+    free(ph); free(pw);
+    int nm;  float *mg = pv_merger(cur, nembd, npx, npy, gf, &nm);  free(cur);
+    int dim; float *pj = pv_projector(mg, nembd, nm, gf, &dim);     free(mg);
+    int ntok; float *fin = pv_img_break(pj, dim, npx / 2, npy / 2, gf, &ntok); free(pj);
+    gguf_close(gf);
+    *o_ntok = ntok; *o_dim = dim;
+    return fin;
+}
+
+
+#endif /* USE_BLAS — native pixtral vision encoder */
+
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     printf("\n  doe.c — Democracy of Experts\n");
@@ -3319,9 +4610,23 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i+1 < argc) snprintf(gguf_path, 256, "%s", argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) { g_n_threads = atoi(argv[++i]); if (g_n_threads < 1) g_n_threads = 1; }
+        else if (strcmp(argv[i], "--rep-penalty") == 0 && i+1 < argc) { g_rep_penalty = atof(argv[++i]); if (g_rep_penalty <= 0.0f) g_rep_penalty = 1.0f; }
+        else if (strcmp(argv[i], "--field-gain") == 0 && i+1 < argc) { g_field_gain = atof(argv[++i]); if (g_field_gain < 0.0f) g_field_gain = 0.0f; }
+        else if (strcmp(argv[i], "--train") == 0 && i+1 < argc) { g_train = atoi(argv[++i]) ? 1 : 0; }
+        else if (strcmp(argv[i], "--max-new") == 0 && i+1 < argc) { g_gen_max_new = atoi(argv[++i]); if (g_gen_max_new < 1) g_gen_max_new = 1; if (g_gen_max_new > 512) g_gen_max_new = 512; }
+        else if (strcmp(argv[i], "--top-k") == 0 && i+1 < argc) { g_gen_top_k = atoi(argv[++i]); if (g_gen_top_k < 0) g_gen_top_k = 0; }
+        else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) { g_gen_temp_override = atof(argv[++i]); if (g_gen_temp_override < 0.0f) g_gen_temp_override = -1.0f; }
+        else if (strcmp(argv[i], "--once") == 0) { g_once = 1; }
+        else if (strcmp(argv[i], "--image") == 0 && i+1 < argc) snprintf(g_image_path, sizeof g_image_path, "%s", argv[++i]);
+        else if (strcmp(argv[i], "--mmproj") == 0 && i+1 < argc) snprintf(g_mmproj_path, sizeof g_mmproj_path, "%s", argv[++i]);
+        else if (strcmp(argv[i], "--img-embeds-bin") == 0 && i+1 < argc) snprintf(g_img_embeds_bin, sizeof g_img_embeds_bin, "%s", argv[++i]);
+        else if (strcmp(argv[i], "--rope-norm") == 0) { g_rope_norm = 1; }
+        else if (strcmp(argv[i], "--no-load-spore") == 0) { g_load_spore = 0; }
+        else if (strcmp(argv[i], "--no-save-spore") == 0) { g_save_spore = 0; }
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--serve") == 0 && i+1 < argc) { g_serve_port = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--serve-public") == 0) { g_serve_public = 1; }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("doe.c — DOE: inference architecture over any GGUF\n\n");
             printf("  --model PATH    GGUF to index (or auto-detect)\n");
@@ -3329,8 +4634,17 @@ int main(int argc, char **argv) {
             printf("  --threads N     CPU threads for matvec (default: all cores)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
-            printf("  --lora-rank N   LoRA rank (default: 16)\n");
-            printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n\n");
+            printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n");
+            printf("  --rep-penalty F repetition penalty over GENERATED tokens (default: 1.0 = off; 1.05 polishes demo tail)\n");
+            printf("  --field-gain F  scale Dario field overlay on logits (default: 1.0; 0 = bare host)\n");
+            printf("  --train N       notorch online-learning during inference (default: 0 = off; 1 = on)\n\n");
+            printf("  --max-new N     max generated tokens in chat mode (default: 200)\n");
+            printf("  --top-k N       chat sampler top-k (default: 40; 1 with --temp 0 matches greedy probes)\n");
+            printf("  --temp F        override chat sampler temperature (default: field temperature; 0 = greedy)\n");
+            printf("  --once          exit after one generated answer (for artifact-isolation probes)\n\n");
+            printf("  --rope-norm     probe llama.cpp NORM RoPE (consecutive head pairs)\n");
+            printf("  --no-load-spore skip mycelium restore for isolated probes\n");
+            printf("  --no-save-spore skip mycelium persist on exit for isolated probes\n\n");
             printf("  BLAS: cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe\n");
             printf("  GPU:  cc doe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o doe\n");
             return 0;
@@ -3338,7 +4652,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── Thread count for matvec ── */
-    g_n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (g_n_threads == 0) g_n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN); /* D-L1: respect --threads if the user set it */
     if (g_n_threads < 1) g_n_threads = 1;
     if (g_n_threads > 32) g_n_threads = 32;
 
@@ -3349,7 +4663,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) F.prophecy = atoi(argv[++i]);
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) F.destiny = atof(argv[++i]);
-        else if (strcmp(argv[i], "--lora-rank") == 0 && i+1 < argc) { /* handled in index_load */ }
+        else if (strcmp(argv[i], "--lora-rank") == 0 && i+1 < argc) { i++; /* D-L1: accepted for compat; rank comes from the GGUF, not a flag */ }
         else if (strcmp(argv[i], "--lora-alpha") == 0 && i+1 < argc) F.lora_alpha = atof(argv[++i]);
     }
 
@@ -3476,8 +4790,16 @@ int main(int argc, char **argv) {
     /* ── Mycelium — check for existing LoRA spores ── */
     MyceliumState mycelium;
     mycelium_init(&mycelium);
-    if (mycelium_load(&idx, idx.profile.fingerprint))
+    if (g_load_spore && mycelium_load(&idx, idx.profile.fingerprint))
         printf("[mycelium] resumed adaptation for this index.\n");
+
+#ifdef USE_METAL
+    /* Parliament-on-GPU: pack the (now final, post-spore) frozen experts into a
+     * registered arena so the election/inject kernels run inside the resident
+     * command buffer at alpha!=0 without dropping x off the GPU. Metal-live +
+     * parliament-active only; experts are static at --train 0. */
+    if (nt_metal_available() && idx.lora_alpha != 0.0f) field_repack_arena(&idx);
+#endif
 
     /* ── Chat or Serve ── */
     if (g_serve_port > 0) {
@@ -3494,7 +4816,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── Save spore on exit ── */
-    mycelium_save(&idx, F.step, F.field_health);
+    if (g_save_spore) mycelium_save(&idx, F.step, F.field_health);
 
     /* ── Cleanup ── */
     index_free(&idx);

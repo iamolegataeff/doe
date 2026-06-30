@@ -1200,7 +1200,7 @@ static void test_rope_position_zero(void) {
     int hd = 4;
     float cc[2] = {1.0f, 1.0f};
     float sc[2] = {0.0f, 0.0f};
-    apply_rope(v, 0, cc, sc, hd);
+    apply_rope_mode(v, 0, cc, sc, hd, 0); /* 0 = half-split (old apply_rope path); identity at pos 0 */
     ASSERT_FLOAT_EQ(v[0], 1.0f, 1e-5f, "rope pos=0 should preserve v[0]");
     ASSERT_FLOAT_EQ(v[1], 2.0f, 1e-5f, "rope pos=0 should preserve v[1]");
     ASSERT_FLOAT_EQ(v[2], 3.0f, 1e-5f, "rope pos=0 should preserve v[2]");
@@ -1223,6 +1223,31 @@ static void test_notorch_zero_signal(void) {
     float a_before = A[0];
     notorch_step(A, B, 4, 4, 2, x, dy, 0.0f);
     ASSERT_FLOAT_EQ(A[0], a_before, 1e-7f, "zero signal should not change weights");
+    PASS();
+}
+
+/* D-H1 proof: the Hebbian channel B must LEARN (grow toward the signal and
+ * self-normalize), not erode. Pre-fix notorch_step only multiplied B by a
+ * decay, so under any signal Sum|B| fell monotonically toward zero — the
+ * delta-voice faded. Post-fix (Oja's rule) B grows toward the principal
+ * direction of dy and stays bounded. The 112 baseline tests never exercised
+ * this trajectory; this is the test that would have caught the bug. */
+static void test_notorch_B_grows_not_fades(void) {
+    TEST(notorch_B_grows_not_fades);
+    field_init();
+    int D = 4, rank = 2;
+    float A[4*2], B[2*4];
+    memset(A, 0, sizeof(A));
+    for (int i = 0; i < rank*D; i++) B[i] = 0.01f;   /* small init, like a fresh expert */
+    float x[]  = {1.0f, 0.5f, 0.2f, 0.1f};
+    float dy[] = {0.8f, 0.3f, 0.1f, 0.4f};
+    float b0 = 0; for (int i = 0; i < rank*D; i++) b0 += fabsf(B[i]);
+    for (int s = 0; s < 2000; s++)
+        notorch_step(A, B, D, D, rank, x, dy, 0.5f);   /* steady reinforcing signal */
+    float b1 = 0, bmax = 0;
+    for (int i = 0; i < rank*D; i++) { b1 += fabsf(B[i]); if (fabsf(B[i]) > bmax) bmax = fabsf(B[i]); }
+    ASSERT_TRUE(b1 > b0, "B must grow under a steady signal (Oja), not decay toward zero");
+    ASSERT_TRUE(bmax < 100.0f, "B must stay bounded (Oja self-normalization, no blow-up)");
     PASS();
 }
 
@@ -1603,6 +1628,7 @@ int main(void) {
     /* NOTORCH */
     printf("\n[notorch]\n");
     test_notorch_zero_signal();
+    test_notorch_B_grows_not_fades();
 
     /* JSON / serve utilities */
     printf("\n[json]\n");
