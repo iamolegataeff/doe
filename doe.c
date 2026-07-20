@@ -1563,6 +1563,7 @@ typedef struct {
     size_t   mmap_size;
     int      host_n_layers, host_dim, host_hidden, host_heads, host_kv_heads, host_head_dim;
     int      host_vocab;
+    uint64_t host_n_params;  /* real param count: sum of n_elements over wired tensors (banner/health, not vocab*dim*2) */
     char     host_arch[64];
     char     host_path[256];
 
@@ -1745,8 +1746,8 @@ static void env_scan(Environment *env, const char *self_src) {
  * the weights are substrate. DOE is the architecture.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 static void init_lora_expert(LoraExpert *e, int dim, int rank, float freq) {
-    e->lora_A = calloc(dim * rank, sizeof(float));
-    e->lora_B = calloc(rank * dim, sizeof(float));
+    e->lora_A = calloc((size_t)dim * rank, sizeof(float));
+    e->lora_B = calloc((size_t)rank * dim, sizeof(float));
     float scale = 0.02f / sqrtf((float)rank);
     for (int i = 0; i < dim*rank; i++) e->lora_A[i] = rand_normal() * scale;
     for (int i = 0; i < rank*dim; i++) e->lora_B[i] = rand_normal() * scale;
@@ -2044,6 +2045,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
             ps->f16_bufs[ps->n_f16_bufs++] = data;
         }
         /* debug: if (i < 15) printf("[tensor] %s dims=[%lu,%lu]\n", n, (unsigned long)tinfo[i].dims[0], (unsigned long)tinfo[i].dims[1]); */
+        int wired_before = wired;
         if (strcmp(n, "token_embd.weight") == 0) {
             ps->host_tok_emb = data;
             if (ps->host_vocab == 0) ps->host_vocab = (int)tinfo[i].dims[1];
@@ -2078,6 +2080,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 else if (l == 0 && strstr(n, "ffn")) { printf("[doe] unwired FFN tensor: %s\n", n); }
             }
         }
+        if (wired > wired_before) ps->host_n_params += n_elems;
     }
     free(tinfo);
 
@@ -2656,8 +2659,8 @@ static void mycelium_save(GGUFIndex *ps, int step, float fitness) {
             if (ex->alive) {
                 fwrite(&ex->vitality, 4, 1, f);
                 fwrite(&ex->frequency, 4, 1, f);
-                fwrite(ex->lora_A, sizeof(float), dim * rank, f);
-                fwrite(ex->lora_B, sizeof(float), rank * dim, f);
+                fwrite(ex->lora_A, sizeof(float), (size_t)dim * rank, f);
+                fwrite(ex->lora_B, sizeof(float), (size_t)rank * dim, f);
             }
         }
     }
@@ -2716,14 +2719,14 @@ static int mycelium_load(GGUFIndex *ps, uint64_t target_fp) {
             int alive; if (fread(&alive, 4, 1, f) != 1) { fclose(f); return 0; }   /* C-2 */
             if (alive) {
                 if (!ex->alive) {
-                    ex->lora_A = calloc(dim * rank, sizeof(float));
-                    ex->lora_B = calloc(rank * dim, sizeof(float));
+                    ex->lora_A = calloc((size_t)dim * rank, sizeof(float));
+                    ex->lora_B = calloc((size_t)rank * dim, sizeof(float));
                     if (!ex->lora_A || !ex->lora_B) { fclose(f); return 0; }   /* C-2/F-1: OOM */
                 }
                 ex->alive = 1;
                 if (fread(&ex->vitality, 4, 1, f) != 1 || fread(&ex->frequency, 4, 1, f) != 1) { fclose(f); return 0; }   /* C-2 */
-                if (fread(ex->lora_A, sizeof(float), dim * rank, f) != (size_t)(dim * rank) ||
-                    fread(ex->lora_B, sizeof(float), rank * dim, f) != (size_t)(rank * dim)) {
+                if (fread(ex->lora_A, sizeof(float), (size_t)dim * rank, f) != (size_t)dim * rank ||
+                    fread(ex->lora_B, sizeof(float), (size_t)rank * dim, f) != (size_t)rank * dim) {
                     fclose(f); return 0; /* D-L3: truncated spore — bail, don't load garbage experts */
                 }
             } else if (ex->alive) {
@@ -2770,9 +2773,9 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     int H = ps->host_hidden;
     s.max_seq = max_seq;
     s.x = calloc(D, 4); s.xb = calloc(D, 4); s.xb2 = calloc(D, 4);
-    s.q = calloc(ps->host_heads * ps->host_head_dim, 4);
+    s.q = calloc((size_t)ps->host_heads * ps->host_head_dim, 4);
     s.k = calloc(kd, 4); s.v = calloc(kd, 4);
-    s.att = calloc(ps->host_heads * max_seq, 4);
+    s.att = calloc((size_t)ps->host_heads * max_seq, 4);
     s.logits = calloc(ps->host_vocab, 4);
     s.hb = calloc(H, 4); s.hb2 = calloc(H * 2, 4); /* *2 for fused gate_up */
     s.expert_out = calloc(D, 4);
@@ -2784,8 +2787,8 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     if (posix_memalign((void**)&s.key_cache,   (size_t)getpagesize(), kv_bytes) ||
         posix_memalign((void**)&s.value_cache, (size_t)getpagesize(), kv_bytes)) {
         fprintf(stderr, "[doe] KV posix_memalign failed — falling back to calloc\n");
-        s.key_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
-        s.value_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+        s.key_cache = calloc((size_t)ps->host_n_layers * max_seq * kd, 4);
+        s.value_cache = calloc((size_t)ps->host_n_layers * max_seq * kd, 4);
     } else {
         memset(s.key_cache, 0, kv_bytes);
         memset(s.value_cache, 0, kv_bytes);
@@ -2797,8 +2800,8 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
 #endif
     }
     int half = ps->host_head_dim / 2;
-    s.cos_cache = calloc(max_seq * half, 4);
-    s.sin_cache = calloc(max_seq * half, 4);
+    s.cos_cache = calloc((size_t)max_seq * half, 4);
+    s.sin_cache = calloc((size_t)max_seq * half, 4);
     float rope_theta = ps->rope_theta;
     for (int p = 0; p < max_seq; p++)
         for (int i = 0; i < half; i++) {
@@ -3601,7 +3604,7 @@ static void chat(GGUFIndex *ps) {
     printf("\n[doe] the parliament is in session. type your message (Ctrl+C to dissipate):\n");
     printf("[doe] host: %s (%s, %dM params)\n\n",
            ps->host_path, ps->host_arch,
-           (int)(ps->host_vocab * ps->host_dim * 2 / 1000000)); /* rough estimate */
+           (int)(ps->host_n_params / 1000000));
 
     float debt_sum = 0; int debt_count = 0;
 
@@ -3633,8 +3636,8 @@ static void chat(GGUFIndex *ps) {
 
         /* Reset KV cache */
         int kd = ps->host_kv_heads * ps->host_head_dim;
-        memset(is.key_cache, 0, ps->host_n_layers * max_seq * kd * 4);
-        memset(is.value_cache, 0, ps->host_n_layers * max_seq * kd * 4);
+        memset(is.key_cache, 0, (size_t)ps->host_n_layers * max_seq * kd * 4);
+        memset(is.value_cache, 0, (size_t)ps->host_n_layers * max_seq * kd * 4);
 
         /* Wrap input in chat template (auto-detected from GGUF chat_template) */
         char wrapped[8192];  /* F-12: match input[8192] so the chat template's closing tags are never silently truncated */
@@ -4209,7 +4212,7 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
                     "\"params\":\"%dM\",\"vocab\":%d,\"layers\":%d,"
                     "\"experts\":%d,\"debt\":%.4f,\"health\":%.4f}",
                     ps->host_path, ps->host_arch,
-                    (int)(ps->host_vocab * ps->host_dim * 2 / 1000000),
+                    (int)(ps->host_n_params / 1000000),
                     ps->host_vocab, ps->host_n_layers,
                     ps->n_field_layers > 0 ? ps->field_layers[0].n_alive : 0,
                     F.debt, F.field_health);
