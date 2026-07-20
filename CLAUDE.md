@@ -52,8 +52,7 @@ shows the *what*). Then, each on its own line:
 - `Method: <a phrase containing "Method", tied to the change>` — not boilerplate.
 - signature — **Claude is named, never de-personalized**: `Co-authored by Claude
   (Arianna Method, <node>) <theariannamethod@gmail.com>, Coordinated with maintainer
-  @iamolegataeff`. Drop `Co-Authored-By: Claude <noreply@anthropic.com>` and `🤖 Generated
-  with Claude Code`. Signature lives in the commit + PR footer only — never in README,
+  @iamolegataeff`. Signature lives in the commit + PR footer only — never in README,
   docs, or DOELOG.
 
 Git author stays `Arianna Method <theariannamethod@gmail.com>`. Never push to `main`
